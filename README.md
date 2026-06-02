@@ -38,9 +38,9 @@ The Vader 5 Pro exposes two USB interfaces:
 
 All the extra inputs — M1–M4, LM, RM, C, Z, rumble — live on interface 1. Interface 0 knows nothing about them.
 
-SDL3's Flydigi HIDAPI driver was written for earlier controllers (Vader 2 Pro, Vader 3 Pro) that use a *numbered* HID report on interface 1. The Vader 5 Pro switched to *unnumbered* 32-byte reports: same magic bytes and payload layout, but the leading report-ID byte is absent, so every offset is off by one. Without the fix, SDL can't parse the reports, falls back to interface 0 via `xpad`, and Steam sees a generic Xbox pad.
+SDL3's Flydigi HIDAPI driver was written for earlier controllers (Vader 2 Pro, Vader 3 Pro) and did not fully bring the Vader 5 Pro's interface 1 into its extended streaming mode on Linux. Without the fix, SDL either fails to parse the vendor reports or Steam falls back to interface 0 via `xpad`, so Steam sees a generic Xbox pad and the extra surface is not reliably remappable.
 
-The upstream fix is not in the SDL build Steam currently ships on Linux, so this repo pins SDL `release-3.4.4` and applies the missing Linux-side Vader 5 Pro patch locally.
+The upstream fix is not in the SDL build Steam currently ships on Linux. This repo builds SDL `main`, applies the local Vader 5 Pro Linux patch, and overlays that SDL only for the Steam client.
 
 ### Why you can't just replace Steam's SDL file
 
@@ -70,18 +70,20 @@ Inside the namespace, Steam's SDL paths resolve to our patched build. `steamui.s
 
 ### What the patch changes
 
-`sdl-flydigi-vader5-linux.patch` adds two things to `SDL_hidapi_flydigi.c`:
+`sdl-flydigi-vader5-linux.patch` updates SDL's Flydigi HIDAPI path for the Vader 5 Pro:
 
-- **`SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports()`** — returns true for Flydigi V2 devices on interface 1. Gates all adjusted read/write paths.
-- **Adjusted packet handling** — `GetReply()` accepts 32-byte reads at offset 0 (no leading report-ID byte); `SDL_HIDAPI_Flydigi_WritePacket()` prepends a synthetic `0x00` report ID so `hid_write()` gets a correctly-shaped 33-byte buffer. Rumble output uses the same format.
+- **Interface-1 driver selection** — forces the Vader 5 Pro's Flydigi interface to use SDL's Flydigi HIDAPI driver instead of losing to the generic path.
+- **Raw 32-byte writes** — sends Vader 5 Pro commands as unnumbered 32-byte reports on interface 1.
+- **padctl-derived init/test mode** — sends the same init sequence and `5a a5 11 07 ... 15 00` enable command that padctl uses to make the controller stream `5a a5 ef ...` extended reports.
+- **Less brittle status handling** — keeps the HIDAPI device available after init instead of hiding it when the controller does not answer the older acquire flow.
 
-Everything else — button mapping, paddle state, gyro parsing — is unchanged and already correct for the Vader 5 Pro's payload layout.
+The existing SDL button mapping is then used for M1-M4, LM, RM, C, Z, and the other extended buttons.
 
 ### The `SDL_TryLockJoysticks` shim
 
-Steam's `steamui.so` is built against Valve's internal SDL fork, which exports `SDL_TryLockJoysticks@@SDL3_0.0.0`. Upstream SDL 3.4.4 doesn't have that symbol, so swapping in our patched upstream build alone makes `dlmopen steamui.so` fail with `undefined symbol: SDL_TryLockJoysticks`.
+Some Steam client builds are built against Valve's internal SDL fork and require `SDL_TryLockJoysticks@@SDL3_0.0.0`. Current SDL `main` exports this symbol, so no shim is needed in the normal install path.
 
-The installer builds a tiny shim (`sdl3_shim{32,64}.so`) that implements `SDL_TryLockJoysticks` by calling `SDL_LockJoysticks` (which exists in upstream SDL) and returning `1`. `patchelf --add-needed sdl3_shim.so` wires it into our patched `libSDL3` so the dynamic loader pulls it in automatically. The wrapper bind-mounts the 32-bit and 64-bit shims into `ubuntu12_32/sdl3_shim.so` and `ubuntu12_64/sdl3_shim.so` next to the (already bind-mounted) patched libSDL3, so `RUNPATH=$ORIGIN` finds them. No host file ever changes.
+If you override `SDL_REF`/`SDL_SRC` to build an older SDL tree that lacks the symbol, the installer builds a tiny optional shim (`sdl3_shim{32,64}.so`) and bind-mounts it next to the patched SDL inside the wrapper namespace. No host Steam file ever changes.
 
 This repo is licensed under MIT. The included patch targets SDL, which is licensed upstream under zlib. If you redistribute patched SDL builds, preserve SDL's upstream notices as required by that project.
 
@@ -92,14 +94,14 @@ Without the udev rule, `xpad` binds to interface 0 and Steam sees two controller
 ## File layout
 
 ```
-~/sdl-build/SDL-3.4.4/                   # pinned SDL source
-~/sdl-build/SDL-3.4.4/build-steam32/     # 32-bit patched SDL build
-~/sdl-build/SDL-3.4.4/build-steam64/     # 64-bit patched SDL build
+~/sdl-build/SDL-main-vader5/                   # patched SDL source
+~/sdl-build/SDL-main-vader5/build-steam32/     # 32-bit patched SDL build
+~/sdl-build/SDL-main-vader5/build-steam64/     # 64-bit patched SDL build
 
 ~/.local/share/vader5-driver/sdl/libSDL3-32.so.0   # deployed 32-bit SDL
 ~/.local/share/vader5-driver/sdl/libSDL3-64.so.0   # deployed 64-bit SDL
-~/.local/share/vader5-driver/sdl/sdl3_shim32.so    # SDL_TryLockJoysticks shim (32-bit)
-~/.local/share/vader5-driver/sdl/sdl3_shim64.so    # SDL_TryLockJoysticks shim (64-bit)
+~/.local/share/vader5-driver/sdl/sdl3_shim32.so    # optional SDL_TryLockJoysticks shim
+~/.local/share/vader5-driver/sdl/sdl3_shim64.so    # optional SDL_TryLockJoysticks shim
 ~/.local/share/vader5-driver/wrapper.sh             # bwrap launcher
 
 # One of the following, depending on distro/setup:
@@ -175,7 +177,7 @@ This project stops being necessary when the Linux stack handles the real control
 
 Required changes:
 
-- **SDL must include the Vader 5 Pro Linux fix.** The Flydigi HIDAPI backend needs to handle the controller's interface-1 protocol correctly: unnumbered fixed-size 32-byte reports for input, status, and rumble/output writes.
+- **SDL must include the Vader 5 Pro Linux fix.** The Flydigi HIDAPI backend needs to select interface 1, send the init/test-mode sequence, and handle the controller's unnumbered fixed-size 32-byte reports for input, status, and rumble/output writes.
 - **Steam must ship a Linux client build that includes that SDL fix.** It is not enough for the patch to exist upstream in SDL; the Steam client on Linux has to actually bundle and use it.
 - **Linux-side access to the real Flydigi `hidraw` interface must work without local overrides.** If Steam cannot open the controller's vendor HID interface as the logged-in user, the local udev rule is still needed.
 - **The generic `xpad` path must stop winning over the real Flydigi HID path.** If Steam still falls back to the Xbox-facing interface first, the local `xpad` unbind rule is still needed.
@@ -212,6 +214,8 @@ Who needs to change what:
    grep -n 'Flydigi\|Vader\|HIDAPI' ~/.local/share/Steam/logs/controller.txt | tail -40
    ```
 
+`evtest` is not the success test for this mode. The udev rule intentionally unbinds `xpad` from interface 0, so the real controller path is Steam/SDL HIDAPI through `/dev/hidraw*`, not a kernel `/dev/input/event*` Xbox device.
+
 **Build fails at 32-bit cmake:**
 
 ```sh
@@ -222,4 +226,4 @@ sudo pacman -S --needed lib32-libx11 lib32-libxext   # Arch/SteamOS
 
 **SDL patch doesn't apply:**
 
-The patch targets SDL `release-3.4.4`. If you point the installer at a different SDL tree and the file layout has changed, apply the patch manually. If `SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports` already exists in the source, this specific patch is no longer needed.
+The patch targets SDL `main` as used by `~/sdl-build/SDL-main-vader5`. If you point the installer at a different SDL tree and the file layout has changed, apply the patch manually. If `SDL_HIDAPI_Flydigi_SendVader5InitSequence` already exists in the source, this specific patch is already applied.

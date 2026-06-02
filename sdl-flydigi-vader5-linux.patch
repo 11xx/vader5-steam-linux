@@ -1,110 +1,183 @@
 diff --git a/src/joystick/hidapi/SDL_hidapi_flydigi.c b/src/joystick/hidapi/SDL_hidapi_flydigi.c
+index 989609c..83d4a17 100644
 --- a/src/joystick/hidapi/SDL_hidapi_flydigi.c
 +++ b/src/joystick/hidapi/SDL_hidapi_flydigi.c
-@@ -78,6 +78,7 @@ enum
+@@ -78,7 +78,11 @@ enum
  #define FLYDIGI_V2_SET_STATUS_COMMAND   0x11
  #define FLYDIGI_V2_HAPTIC_COMMAND       0x12
  #define FLYDIGI_V2_ACQUIRE_CONTROLLER_COMMAND 0x1C
 +#define FLYDIGI_V2_RAW_PACKET_SIZE 32
  #define FLYDIGI_V2_INPUT_REPORT         0xEF
++#define FLYDIGI_V2_TEST_MODE_LENGTH     0x07
++#define FLYDIGI_V2_TEST_MODE_ENABLE     0x15
++#define FLYDIGI_V2_TEST_MODE_DISABLE    0x14
  
  typedef struct
-@@ -358,6 +359,33 @@ static bool HIDAPI_DriverFlydigi_InitControllerV1(SDL_HIDAPI_Device *device)
+ {
+@@ -299,14 +303,16 @@ static int HIDAPI_DriverFlydigi_WritePacket(SDL_HIDAPI_Device *device, const Uin
+ {
+     // We know that at the very least the Vader 5 now uses unnumbered reports for commands instead of FLYDIGI_V2_CMD_REPORT_ID.
+     // If other Flydigi things prove to do the same, we can tweak this check to be more general.
+-    bool bUsesUnnumberedReports = (device->vendor_id == USB_VENDOR_FLYDIGI_V2 && device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER);
++    bool bUsesUnnumberedReports = (device->vendor_id == USB_VENDOR_FLYDIGI_V2 && device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER && device->interface_number == 1);
+ 
+     if (bUsesUnnumberedReports && data[0] == FLYDIGI_V2_CMD_REPORT_ID) {
+-        // Zero out the report byte.
+-        Uint8 output[USB_PACKET_LENGTH];
+-        SDL_memcpy(output, data, SDL_min(size, USB_PACKET_LENGTH));
+-        output[0] = 0;
+-        return SDL_hid_write(device->dev, output, SDL_min(size, USB_PACKET_LENGTH));
++        Uint8 output[FLYDIGI_V2_RAW_PACKET_SIZE];
++        size_t payload_size;
++
++        SDL_zeroa(output);
++        payload_size = SDL_min(size - 1, (size_t)FLYDIGI_V2_RAW_PACKET_SIZE);
++        SDL_memcpy(output, data + 1, payload_size);
++        return SDL_hid_write(device->dev, output, sizeof(output));
+     }
+ 
+     return SDL_hid_write(device->dev, data, size);
+@@ -415,7 +421,7 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
+         FLYDIGI_V2_MAGIC2,
+         FLYDIGI_V2_GET_INFO_COMMAND,
+         2,
+-        0
++        3
+     };
+ 
+     if (HIDAPI_DriverFlydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
+@@ -424,6 +430,23 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
      return true;
  }
  
-+static bool SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports(SDL_HIDAPI_Device *device)
++static bool SDL_HIDAPI_Flydigi_SendVader5InitSequence(SDL_HIDAPI_Device *device)
 +{
-+    return device->vendor_id == USB_VENDOR_FLYDIGI_V2 && device->interface_number == 1;
-+}
++    static const Uint8 commands[][6] = {
++        { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, 0x01, 0x02, 0x03 },
++        { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, 0xA1, 0x02, 0xA3 },
++        { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, 0x02, 0x02, 0x04 },
++        { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, 0x04, 0x02, 0x06 },
++    };
 +
-+static int SDL_HIDAPI_Flydigi_WritePacket(SDL_HIDAPI_Device *device, const Uint8 *packet, size_t size)
-+{
-+    if (SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports(device)) {
-+        Uint8 raw_packet[FLYDIGI_V2_RAW_PACKET_SIZE + 1];
-+        size_t payload_size;
-+
-+        SDL_zeroa(raw_packet);
-+
-+        // hidapi wants a synthetic 0 report ID for unnumbered reports.
-+        if (size > 0 && packet[0] == FLYDIGI_V2_CMD_REPORT_ID) {
-+            ++packet;
-+            --size;
++    for (int i = 0; i < SDL_arraysize(commands); ++i) {
++        if (HIDAPI_DriverFlydigi_WritePacket(device, commands[i], sizeof(commands[i])) < 0) {
++            return SDL_SetError("Couldn't send Vader 5 init command");
 +        }
-+
-+        payload_size = SDL_min(size, (size_t)FLYDIGI_V2_RAW_PACKET_SIZE);
-+        SDL_memcpy(&raw_packet[1], packet, payload_size);
-+        return SDL_hid_write(device->dev, raw_packet, sizeof(raw_packet));
 +    }
-+
-+    return SDL_hid_write(device->dev, packet, size);
++    return true;
 +}
 +
- static bool GetReply(SDL_HIDAPI_Device* device, Uint8 command, Uint8* data, size_t length)
+ static void HIDAPI_DriverFlydigi_HandleInfoResponse(SDL_Joystick *joystick, SDL_DriverFlydigi_Context *ctx, Uint8 *data, int size)
  {
-     for (int i = 0; i < 100; ++i) {
-@@ -374,10 +402,14 @@ static bool GetReply(SDL_HIDAPI_Device* device, Uint8 command, Uint8* data, size
- #ifdef DEBUG_FLYDIGI_PROTOCOL
-         HIDAPI_DumpPacket("Flydigi packet: size = %d", data, size);
- #endif
--
--        if (size == 32) {
--            if (data[1] == FLYDIGI_V2_MAGIC1 && data[2] == FLYDIGI_V2_MAGIC2) {
--                // Skip the report ID
-+        if (size >= 32) {
-+            if (size > 32 && data[1] == FLYDIGI_V2_MAGIC1 && data[2] == FLYDIGI_V2_MAGIC2) {
-+                // hidapi may prefix a synthetic zero report ID for unnumbered replies.
-+                SDL_memmove(&data[0], &data[1], size - 1);
-+                data[size - 1] = 0;
-+                --size;
-+            } else if (size == 32 && data[1] == FLYDIGI_V2_MAGIC1 && data[2] == FLYDIGI_V2_MAGIC2) {
-+                // Skip the report ID on numbered interfaces.
-                 SDL_memmove(&data[0], &data[1], size - 1);
-                 data[size - 1] = 0;
-             }
-@@ -399,7 +431,7 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
-         2,
-         0
-     };
--    if (SDL_hid_write(device->dev, cmd, sizeof(cmd)) < 0) {
-+    if (SDL_HIDAPI_Flydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
-         return SDL_SetError("Couldn't query controller info");
+     SDL_PowerState state;
+@@ -471,36 +494,34 @@ static void HIDAPI_DriverFlydigi_HandleStatusResponse(SDL_HIDAPI_Device *device,
+ {
+     if (data[9] == 1) {
+         HIDAPI_DriverFlydigi_SetAvailable(device, true);
+-    } else {
+-        // Click "Allow third-party apps to take over mappings" in the FlyDigi Space Station app
+-        HIDAPI_DriverFlydigi_SetAvailable(device, false);
      }
-     return true;
-@@ -441,7 +473,7 @@ static bool SDL_HIDAPI_Flydigi_SendStatusRequest(SDL_HIDAPI_Device *device)
+ }
+ 
+-static bool SDL_HIDAPI_Flydigi_SendAcquireRequest(SDL_HIDAPI_Device *device, bool acquire)
++static bool SDL_HIDAPI_Flydigi_SendTestModeRequest(SDL_HIDAPI_Device *device, bool enable)
+ {
+     const Uint8 cmd[32] = {
+         FLYDIGI_V2_CMD_REPORT_ID,
+         FLYDIGI_V2_MAGIC1,
          FLYDIGI_V2_MAGIC2,
-         FLYDIGI_V2_GET_STATUS_COMMAND
+-        FLYDIGI_V2_ACQUIRE_CONTROLLER_COMMAND,
+-        23,
+-        acquire ? 1 : 0,
+-        'S', 'D', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
++        FLYDIGI_V2_SET_STATUS_COMMAND,
++        FLYDIGI_V2_TEST_MODE_LENGTH,
++        0xFF,
++        enable ? 0x01 : 0x00,
++        0xFF,
++        0xFF,
++        0xFF,
++        enable ? FLYDIGI_V2_TEST_MODE_ENABLE : FLYDIGI_V2_TEST_MODE_DISABLE,
++        0x00
      };
--    if (SDL_hid_write(device->dev, cmd, sizeof(cmd)) < 0) {
-+    if (SDL_HIDAPI_Flydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
-         return SDL_SetError("Couldn't query controller status");
+ 
+     if (HIDAPI_DriverFlydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
+-        return SDL_SetError("Couldn't send acquire command");
++        return SDL_SetError("Couldn't send test mode command");
      }
      return true;
-@@ -469,8 +501,8 @@ static bool SDL_HIDAPI_Flydigi_SendAcquireRequest(SDL_HIDAPI_Device *device, boo
-         acquire ? 1 : 0,
-         'S', 'D', 'L', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
-     };
--
--    if (SDL_hid_write(device->dev, cmd, sizeof(cmd)) < 0) {
-+
-+    if (SDL_HIDAPI_Flydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
-         return SDL_SetError("Couldn't send acquire command");
-     }
+ }
+ 
+ static void HIDAPI_DriverFlydigi_HandleAcquireResponse(SDL_HIDAPI_Device *device, Uint8 *data, int size)
+ {
+-    if (data[5] != 1 && data[6] == 0) {
+-        // Controller acquiring failed or has been disabled
+-        HIDAPI_DriverFlydigi_SetAvailable(device, false);
+-    }
+ }
+ 
+ static bool HIDAPI_DriverFlydigi_InitControllerV2(SDL_HIDAPI_Device *device)
+@@ -552,8 +573,12 @@ static bool HIDAPI_DriverFlydigi_InitControllerV2(SDL_HIDAPI_Device *device)
+ 
+     HIDAPI_DriverFlydigi_UpdateDeviceIdentity(device);
+ 
+-    // See whether we can acquire the controller
+-    SDL_HIDAPI_Flydigi_SendStatusRequest(device);
++    // Match padctl's Vader 5 Pro init sequence so IF1 streams the extended report.
++    if (device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER) {
++        SDL_HIDAPI_Flydigi_SendVader5InitSequence(device);
++    }
++    SDL_HIDAPI_Flydigi_SendTestModeRequest(device, true);
++    HIDAPI_DriverFlydigi_SetAvailable(device, true);
+ 
      return true;
-@@ -613,8 +645,14 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
-         Uint8 rumble_packet[] = { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, FLYDIGI_V2_HAPTIC_COMMAND, 6, 0, 0, 0, 0, 0 };
+ }
+@@ -633,7 +658,11 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
          rumble_packet[5] = low_frequency_rumble >> 8;
          rumble_packet[6] = high_frequency_rumble >> 8;
--
+ 
 -        if (SDL_HIDAPI_SendRumble(device, rumble_packet, sizeof(rumble_packet)) != sizeof(rumble_packet)) {
-+        if (SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports(device)) {
-+            Uint8 raw_packet[FLYDIGI_V2_RAW_PACKET_SIZE + 1];
-+            SDL_zeroa(raw_packet);
-+            SDL_memcpy(&raw_packet[1], &rumble_packet[1], sizeof(rumble_packet) - 1);
-+            if (SDL_HIDAPI_SendRumble(device, raw_packet, sizeof(raw_packet)) != sizeof(raw_packet)) {
++        if (device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER && device->interface_number == 1) {
++            if (HIDAPI_DriverFlydigi_WritePacket(device, rumble_packet, sizeof(rumble_packet)) < 0) {
 +                return SDL_SetError("Couldn't send rumble packet");
 +            }
 +        } else if (SDL_HIDAPI_SendRumble(device, rumble_packet, sizeof(rumble_packet)) != sizeof(rumble_packet)) {
              return SDL_SetError("Couldn't send rumble packet");
          }
      }
+@@ -1004,7 +1033,7 @@ static bool HIDAPI_DriverFlydigi_UpdateDevice(SDL_HIDAPI_Device *device)
+ 
+     if (device->vendor_id == USB_VENDOR_FLYDIGI_V2 && joystick) {
+         if (!ctx->next_heartbeat || now >= ctx->next_heartbeat) {
+-            SDL_HIDAPI_Flydigi_SendAcquireRequest(device, true);
++            SDL_HIDAPI_Flydigi_SendTestModeRequest(device, true);
+             SDL_HIDAPI_Flydigi_SendInfoRequest(device);
+             ctx->next_heartbeat = now + FLYDIGI_ACQUIRE_CONTROLLER_HEARTBEAT_TIME;
+         }
+@@ -1042,7 +1071,7 @@ static void HIDAPI_DriverFlydigi_CloseJoystick(SDL_HIDAPI_Device *device, SDL_Jo
+ {
+     // Don't unacquire the controller, someone else might be using it too.
+     // The controller will automatically unacquire itself after a little while
+-    //SDL_HIDAPI_Flydigi_SendAcquireRequest(device, false);
++    //SDL_HIDAPI_Flydigi_SendTestModeRequest(device, false);
+ }
+ 
+ static void HIDAPI_DriverFlydigi_FreeDevice(SDL_HIDAPI_Device *device)
+diff --git a/src/joystick/hidapi/SDL_hidapijoystick.c b/src/joystick/hidapi/SDL_hidapijoystick.c
+index c8bca94..7fc06cc 100644
+--- a/src/joystick/hidapi/SDL_hidapijoystick.c
++++ b/src/joystick/hidapi/SDL_hidapijoystick.c
+@@ -382,6 +382,12 @@ static SDL_HIDAPI_DeviceDriver *HIDAPI_GetDeviceDriver(SDL_HIDAPI_Device *device
+         }
+     }
+ 
++    if (device->vendor_id == USB_VENDOR_FLYDIGI_V2 &&
++        device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER &&
++        device->interface_number == 1) {
++        return &SDL_HIDAPI_DriverFlydigi;
++    }
++
+     for (i = 0; i < SDL_arraysize(SDL_HIDAPI_drivers); ++i) {
+         SDL_HIDAPI_DeviceDriver *driver = SDL_HIDAPI_drivers[i];
+         if (driver->enabled && driver->IsSupportedDevice(device, device->name, device->type, device->vendor_id, device->product_id, device->version, device->interface_number, device->interface_class, device->interface_subclass, device->interface_protocol)) {

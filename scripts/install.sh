@@ -12,8 +12,8 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." &>/dev/null && pwd)"
 
-SDL_REF="${SDL_REF:-release-3.4.4}"
-SDL_SRC="${SDL_SRC:-$HOME/sdl-build/SDL-3.4.4}"
+SDL_REF="${SDL_REF:-main}"
+SDL_SRC="${SDL_SRC:-$HOME/sdl-build/SDL-main-vader5}"
 SDL_REPO_URL="https://github.com/libsdl-org/SDL.git"
 
 DEPLOY_DIR="$HOME/.local/share/vader5-driver"
@@ -395,17 +395,23 @@ ok "Prerequisites satisfied"
 # ── 2. SDL source ─────────────────────────────────────────────────────────────
 info "SDL source: $SDL_SRC"
 
-if [[ ! -d "$SDL_SRC/.git" ]]; then
+if [[ -d "$SDL_SRC/.git" ]]; then
+    info "SDL source already present at $SDL_SRC"
+elif [[ -d "$SDL_SRC" && -n "$(find "$SDL_SRC" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    err "SDL source directory exists but is not a git checkout: $SDL_SRC"
+    err "Move or remove it, then re-run:"
+    err "  mv \"$SDL_SRC\" \"${SDL_SRC}.bak\""
+    err "  # or: rm -rf \"$SDL_SRC\""
+    exit 1
+else
     info "Cloning SDL $SDL_REF into $SDL_SRC"
     mkdir -p "$(dirname "$SDL_SRC")"
     git clone --quiet --branch "$SDL_REF" --depth 1 "$SDL_REPO_URL" "$SDL_SRC"
     ok "SDL cloned"
-else
-    info "SDL source already present at $SDL_SRC"
 fi
 
 # Apply patch if the key symbol isn't already there
-if grep -q 'SDL_HIDAPI_Flydigi_UsesUnnumbered32ByteReports' \
+if grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' \
         "$SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c" 2>/dev/null; then
     ok "Flydigi Linux patch already applied"
 else
@@ -431,7 +437,7 @@ else
         || { err "cmake 64-bit failed — see /tmp/sdl-cmake64.log"; exit 1; }
 
     info "Building 64-bit SDL (this takes a few minutes)"
-    cmake --build "$SDL_BUILD64" -j"$(nproc)" \
+    cmake --build "$SDL_BUILD64" --target SDL3-shared -j"$(nproc)" \
         > /tmp/sdl-build64.log 2>&1 \
         || { err "build 64-bit failed — see /tmp/sdl-build64.log"; exit 1; }
     ok "64-bit SDL built"
@@ -477,7 +483,7 @@ else
         || { err "cmake 32-bit failed — see /tmp/sdl-cmake32.log"; exit 1; }
 
     info "Building 32-bit SDL (this takes a few minutes)"
-    cmake --build "$SDL_BUILD32" -j"$(nproc)" \
+    cmake --build "$SDL_BUILD32" --target SDL3-shared -j"$(nproc)" \
         > /tmp/sdl-build32.log 2>&1 \
         || { err "build 32-bit failed — see /tmp/sdl-build32.log"; exit 1; }
     ok "32-bit SDL built"
@@ -505,24 +511,29 @@ strip --strip-unneeded "$SDL_DEPLOY_DIR/libSDL3-32.so.0" 2>/dev/null || true
 
 ok "SDL deployed"
 
+_has_trylock_symbol() {
+    readelf --dyn-syms --wide "$1" 2>/dev/null \
+        | awk '{print $8}' \
+        | grep -Eq '^SDL_TryLockJoysticks(@@|@|$)'
+}
+
 # ── 5b. SDL_TryLockJoysticks shim ─────────────────────────────────────────────
-# Steam's `steamui.so` requires `SDL_TryLockJoysticks@@SDL3_0.0.0`, a symbol
-# Valve's internal SDL fork exports but upstream SDL 3.4.4 does not. Without
-# it, dlmopen of steamui.so fails before the client UI ever appears.
-#
-# Reported by RavioliAM (issue #2) on Nobara 43. We build a tiny shim that
-# implements the symbol via SDL_LockJoysticks (which IS in upstream SDL),
-# patchelf it onto our libSDL3 as NEEDED, and bind-mount it next to libSDL3
-# inside the bwrap namespace so RUNPATH=$ORIGIN finds it at load time.
-info "Building SDL_TryLockJoysticks shim"
+# Some Steam clients require `SDL_TryLockJoysticks@@SDL3_0.0.0`, a symbol from
+# Valve's SDL fork. Current SDL main exports it; older upstream releases do not.
+if _has_trylock_symbol "$SDL_DEPLOY_DIR/libSDL3-64.so.0" \
+        && _has_trylock_symbol "$SDL_DEPLOY_DIR/libSDL3-32.so.0"; then
+    rm -f "$SDL_DEPLOY_DIR/sdl3_shim64.so" "$SDL_DEPLOY_DIR/sdl3_shim32.so"
+    ok "SDL_TryLockJoysticks is exported by SDL; shim not needed"
+else
+    info "Building SDL_TryLockJoysticks shim"
 
-SHIM_BUILD="$(mktemp -d)"
-trap 'rm -rf "$SHIM_BUILD"' EXIT
+    SHIM_BUILD="$(mktemp -d)"
+    trap 'rm -rf "$SHIM_BUILD"' EXIT
 
-cat > "$SHIM_BUILD/sdl3_shim.c" <<'SHIM_C_EOF'
+    cat > "$SHIM_BUILD/sdl3_shim.c" <<'SHIM_C_EOF'
 /* Shim providing SDL_TryLockJoysticks for Steam clients built against
- * Valve's internal SDL fork. Upstream SDL 3.4.4 does not export this
- * symbol, so steamui.so fails to load against an unmodified upstream SDL.
+ * Valve's internal SDL fork. Older upstream SDL releases do not export this
+ * symbol, so steamui.so can fail to load against an unmodified upstream SDL.
  *
  * Implementation: forward to SDL_LockJoysticks (always succeeds → return 1).
  */
@@ -535,39 +546,38 @@ int SDL_TryLockJoysticks(void)
 }
 SHIM_C_EOF
 
-cat > "$SHIM_BUILD/sdl3_shim.map" <<'SHIM_MAP_EOF'
+    cat > "$SHIM_BUILD/sdl3_shim.map" <<'SHIM_MAP_EOF'
 SDL3_0.0.0 {
     global: SDL_TryLockJoysticks;
     local: *;
 };
 SHIM_MAP_EOF
 
-_build_shim() {
-    local bits="$1" out="$2" sdl_lib="$3"
-    gcc -shared -fPIC -m"$bits" \
-        -Wl,--version-script="$SHIM_BUILD/sdl3_shim.map" \
-        -Wl,-soname,sdl3_shim.so \
-        -o "$out" "$SHIM_BUILD/sdl3_shim.c" \
-        -L"$SDL_DEPLOY_DIR" \
-        -Wl,-rpath,"$SDL_DEPLOY_DIR" \
-        -l:"$(basename "$sdl_lib")" \
-        || { err "$bits-bit shim build failed"; exit 1; }
-}
+    _build_shim() {
+        local bits="$1" out="$2" sdl_lib="$3"
+        gcc -shared -fPIC -m"$bits" \
+            -Wl,--version-script="$SHIM_BUILD/sdl3_shim.map" \
+            -Wl,-soname,sdl3_shim.so \
+            -o "$out" "$SHIM_BUILD/sdl3_shim.c" \
+            -L"$SDL_DEPLOY_DIR" \
+            -Wl,-rpath,"$SDL_DEPLOY_DIR" \
+            -l:"$(basename "$sdl_lib")" \
+            || { err "$bits-bit shim build failed"; exit 1; }
+    }
 
-_build_shim 64 "$SDL_DEPLOY_DIR/sdl3_shim64.so" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
-_build_shim 32 "$SDL_DEPLOY_DIR/sdl3_shim32.so" "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
+    _build_shim 64 "$SDL_DEPLOY_DIR/sdl3_shim64.so" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
+    _build_shim 32 "$SDL_DEPLOY_DIR/sdl3_shim32.so" "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
 
-# Make patched libSDL3 pull in the shim. patchelf is a no-op if the entry is
-# already there, so the install script stays idempotent.
-for _arch in 32 64; do
-    _lib="$SDL_DEPLOY_DIR/libSDL3-${_arch}.so.0"
-    if ! patchelf --print-needed "$_lib" 2>/dev/null | grep -qx 'sdl3_shim.so'; then
-        patchelf --add-needed sdl3_shim.so "$_lib" \
-            || { err "patchelf failed on $_lib"; exit 1; }
-    fi
-done
+    for _arch in 32 64; do
+        _lib="$SDL_DEPLOY_DIR/libSDL3-${_arch}.so.0"
+        if ! patchelf --print-needed "$_lib" 2>/dev/null | grep -qx 'sdl3_shim.so'; then
+            patchelf --add-needed sdl3_shim.so "$_lib" \
+                || { err "patchelf failed on $_lib"; exit 1; }
+        fi
+    done
 
-ok "SDL_TryLockJoysticks shim built and wired"
+    ok "SDL_TryLockJoysticks shim built and wired"
+fi
 
 # ── 6. Deploy bwrap wrapper ───────────────────────────────────────────────────
 info "Deploying bwrap wrapper"
@@ -596,9 +606,9 @@ if [[ ! -x "$STEAM_LAUNCHER" ]]; then
     exit 1
 fi
 
-for _f in "$SDL32" "$SDL64" "$SHIM32" "$SHIM64"; do
+for _f in "$SDL32" "$SDL64"; do
     if [[ ! -f "$_f" ]]; then
-        echo "vader5-driver wrapper: patched SDL/shim not found: $_f" >&2
+        echo "vader5-driver wrapper: patched SDL not found: $_f" >&2
         echo "  Re-run: bash scripts/install.sh" >&2
         exit 1
     fi
@@ -607,15 +617,22 @@ done
 export SDL_JOYSTICK_HIDAPI=1
 unset SDL_GAMECONTROLLERCONFIG
 
-exec "$BWRAP" \
+ARGS=(
     --bind / / \
     --dev-bind /dev /dev \
     --proc /proc \
     --bind "$SDL32" "$STEAM32" \
-    --bind "$SDL64" "$STEAM64" \
-    --bind "$SHIM32" "$STEAM_SHIM32" \
-    --bind "$SHIM64" "$STEAM_SHIM64" \
-    -- "$STEAM_LAUNCHER" "$@"
+    --bind "$SDL64" "$STEAM64"
+)
+
+if [[ -f "$SHIM32" && -f "$SHIM64" ]]; then
+    ARGS+=(
+        --bind "$SHIM32" "$STEAM_SHIM32"
+        --bind "$SHIM64" "$STEAM_SHIM64"
+    )
+fi
+
+exec "$BWRAP" "${ARGS[@]}" -- "$STEAM_LAUNCHER" "$@"
 WRAPPER_EOF
 
 sed -i.bak "s|@@STEAM_LAUNCHER@@|$STEAM_LAUNCHER|g" "$WRAPPER_DST"
