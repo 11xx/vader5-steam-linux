@@ -10,6 +10,8 @@ bash scripts/install.sh
 
 Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. After it finishes, replug the controller. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
 
+For the debugging notes, confirmed behavior, and protocol findings behind this fix, see [FIX.md](FIX.md).
+
 To uninstall: `bash scripts/uninstall.sh`
 
 ## Compatibility
