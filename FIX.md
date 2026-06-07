@@ -156,6 +156,8 @@ The SDL patch currently does the following:
 - Keeps the device available instead of hiding it when the older acquire status
   does not match expectations.
 - Sends Vader 5 Pro rumble through the same raw 32-byte interface-1 write path.
+- Exposes SDL trigger rumble for Vader 5 Pro and maps it to the two trigger
+  motors discovered with `tools/vader5_rumble_probe.c`.
 
 The rumble bug that was fixed late in testing:
 
@@ -164,6 +166,26 @@ The rumble bug that was fixed late in testing:
 - Vader 5 Pro is V2, so rumble still used SDL's generic helper.
 - Moving that branch into the V2 path made SDL send `5a a5 12 06 ...` directly
   through the raw write helper.
+
+The later four-motor rumble fix:
+
+- The validated raw payload is:
+
+```text
+5a a5 12 06 left_grip right_grip left_trigger right_trigger 00 00 ...
+```
+
+- `slot 0` / raw byte 4: left grip rumble.
+- `slot 1` / raw byte 5: right grip rumble.
+- `slot 2` / raw byte 6: left trigger rumble.
+- `slot 3` / raw byte 7: right trigger rumble.
+- `slot 4` and `slot 5` did not produce observable rumble in testing.
+- Pair tests worked for all four active motor slots.
+
+The SDL driver stores the last normal-rumble and trigger-rumble values in the
+Flydigi context and always sends one combined four-motor packet. This matters
+because SDL normal rumble and SDL trigger rumble are separate APIs, while the
+Vader 5 packet carries all motor intensities together.
 
 ## Installer Findings
 
@@ -194,6 +216,22 @@ paths resolve to files with different sizes. That is expected. The important
 property is that the verifier cannot replace the host files because the patched
 files are only mounted over Steam's paths inside the wrapper namespace.
 
+On newer Steam clients, especially the public beta seen on June 7, 2026, the
+client may try to repair the bind-mounted SDL files on each launch and then
+exit when the bind mount prevents renaming `libSDL3.so.0`. The wrapper now
+passes Steam's own `-noverifyfiles -norepairfiles` flags to avoid that repair
+loop while still leaving Steam's host files untouched.
+
+If the beta client keeps forcing bootstrap repairs, disable the beta once with:
+
+```sh
+mv ~/.local/share/Steam/package/beta ~/.local/share/Steam/package/beta.disabled-vader5
+/usr/bin/steam
+```
+
+After Steam finishes switching channels, close it and relaunch through
+`~/.local/share/vader5-driver/wrapper.sh`.
+
 ## Known Caveats
 
 - Flatpak Steam is not supported.
@@ -204,40 +242,18 @@ files are only mounted over Steam's paths inside the wrapper namespace.
 - Game-specific Steam Input quirks can still exist even when the controller path
   is correct.
 
-## Open Rumble Work
+## Rumble Probe Notes
 
-The currently validated Vader 5 Pro rumble packet is:
-
-```text
-5a a5 12 06 strong weak 00 00 00 00 ...
-```
-
-The SDL patch sends that command through the interface-1 raw write path, which
-is enough for normal SDL rumble and has been confirmed in Steam.
-
-The controller may have additional physical trigger motors, but the public
-padctl and flydigi-vader5 protocol notes only document the two `strong` and
-`weak` rumble bytes. The remaining bytes in the `0x12 0x06` payload are not
-mapped yet. Do not blindly expose SDL trigger rumble until those bytes are
-identified on hardware.
-
-Use `tools/vader5_rumble_probe.c` to sweep the rumble payload slots and record
-which physical motor responds:
+`tools/vader5_rumble_probe.c` sweeps the rumble payload slots and records
+which physical motor responds. It was used to identify the trigger motors and
+is still useful if a future firmware revision changes the packet layout.
 
 ```sh
 cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
 
 # Close Steam first so it is not also writing HID packets.
 /tmp/vader5_rumble_probe /dev/hidrawN
-
-# If the undocumented slots do nothing, repeat with the checksum variant:
-/tmp/vader5_rumble_probe /dev/hidrawN --checksum
 ```
-
-Report the physical result as slot numbers, for example `slot 0 = left grip`,
-`slot 1 = right grip`, `slot 2 = left trigger`. Once the trigger slots are
-known, SDL can advertise `SDL_JOYSTICK_CAP_TRIGGER_RUMBLE` and implement
-`HIDAPI_DriverFlydigi_RumbleJoystickTriggers()` for Vader 5 Pro only.
 
 ## Steam Input UI Quirks
 

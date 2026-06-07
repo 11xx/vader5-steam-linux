@@ -187,12 +187,12 @@ int main(int argc, char **argv)
     printf("\n");
 
     const char *labels[] = {
-        "slot 0: raw byte 4, current low/strong rumble",
-        "slot 1: raw byte 5, current high/weak rumble",
-        "slot 2: raw byte 6, undocumented",
-        "slot 3: raw byte 7, undocumented",
-        "slot 4: raw byte 8, undocumented/checksum byte",
-        "slot 5: raw byte 9, undocumented",
+        "slot 0: raw byte 4, left grip rumble",
+        "slot 1: raw byte 5, right grip rumble",
+        "slot 2: raw byte 6, left trigger rumble",
+        "slot 3: raw byte 7, right trigger rumble",
+        "slot 4: raw byte 8, unused/checksum byte",
+        "slot 5: raw byte 9, unused in current testing",
     };
 
     for (int slot = 0; slot < 6; ++slot) {

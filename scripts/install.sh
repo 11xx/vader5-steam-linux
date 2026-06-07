@@ -632,7 +632,7 @@ if [[ -f "$SHIM32" && -f "$SHIM64" ]]; then
     )
 fi
 
-exec "$BWRAP" "${ARGS[@]}" -- "$STEAM_LAUNCHER" "$@"
+exec "$BWRAP" "${ARGS[@]}" -- "$STEAM_LAUNCHER" -noverifyfiles -norepairfiles "$@"
 WRAPPER_EOF
 
 sed -i.bak "s|@@STEAM_LAUNCHER@@|$STEAM_LAUNCHER|g" "$WRAPPER_DST"
