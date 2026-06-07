@@ -8,7 +8,7 @@ Makes Steam detect the Vader 5 Pro natively via SDL's Flydigi HIDAPI driver, giv
 bash scripts/install.sh
 ```
 
-Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. After it finishes, replug the controller. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
+Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. It also installs the udev and boot-time xpad cleanup needed for already-connected dongles. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
 
 For the debugging notes, confirmed behavior, and protocol findings behind this fix, see [FIX.md](FIX.md).
 
@@ -65,10 +65,10 @@ exec bwrap \
     --proc /proc                   \  # /proc for Steam's self-inspection
     --bind "$SDL32" "$STEAM32"     \  # patched 32-bit SDL over Steam's copy
     --bind "$SDL64" "$STEAM64"     \  # patched 64-bit SDL over Steam's copy
-    -- "$STEAM_LAUNCHER" "$@"
+    -- "$STEAM_LAUNCHER" -noverifyfiles -norepairfiles "$@"
 ```
 
-Inside the namespace, Steam's SDL paths resolve to our patched build. `steamui.so`'s `NEEDED: libSDL3.so.0` is satisfied by our SDL via `RUNPATH=$ORIGIN`. The host filesystem is never touched — the verifier has nothing to detect.
+Inside the namespace, Steam's SDL paths resolve to our patched build. `steamui.so`'s `NEEDED: libSDL3.so.0` is satisfied by our SDL via `RUNPATH=$ORIGIN`. The host filesystem is never touched, and the wrapper passes Steam's `-noverifyfiles -norepairfiles` flags so the bootstrapper does not try to repair the bind-mounted SDL paths.
 
 ### What the patch changes
 
@@ -91,7 +91,13 @@ This repo is licensed under MIT. The included patch targets SDL, which is licens
 
 ### xpad unbind
 
-Without the udev rule, `xpad` binds to interface 0 and Steam sees two controllers: a generic Xbox pad alongside the Flydigi HIDAPI device. `60-vader5-sdl.rules` fires on device add, unbinds xpad from interface 0, and grants `hidraw` access so Steam can open interface 1 without root.
+Without the udev rule, `xpad` binds to interface 0 and Steam sees two controllers: a generic Xbox pad alongside the Flydigi HIDAPI device. `60-vader5-sdl.rules` fires on device add and driver bind, unbinds xpad from interface 0, and grants `hidraw` access so Steam can open interface 1 without root.
+
+The installer also installs `/etc/vader5-driver/xpad-unbind.sh` and enables
+`vader5-xpad-unbind.service`. That oneshot service scans already-connected
+dongles at boot and unbinds xpad from the Vader's interface 0. This closes the
+common reboot race where the dongle is present before the udev rule gets a
+fresh hotplug event.
 
 ## File layout
 
@@ -111,6 +117,8 @@ Without the udev rule, `xpad` binds to interface 0 and Steam sees two controller
 ~/.local/share/applications/steam.desktop
 
 /etc/udev/rules.d/60-vader5-sdl.rules
+/etc/vader5-driver/xpad-unbind.sh
+/etc/systemd/system/vader5-xpad-unbind.service
 ```
 
 Nothing is written under `/usr`, `/usr/local`, or Steam's own file tree.
@@ -144,7 +152,7 @@ On SteamOS, run `passwd` first if you haven't set a sudo password.
 
 ## Survives updates?
 
-Yes. The patched SDL and wrapper live in `~/.local/share/vader5-driver/` and the systemd or desktop wiring lives in `~/.config/` or `~/.local/share/applications/` — all of which persist across Steam updates and SteamOS A/B partition updates. The udev rule lives in `/etc/udev/rules.d/` which is overlayfs-backed on SteamOS. Steam's own files are never modified.
+Yes. The patched SDL and wrapper live in `~/.local/share/vader5-driver/` and the systemd or desktop wiring lives in `~/.config/` or `~/.local/share/applications/` — all of which persist across Steam updates and SteamOS A/B partition updates. The udev rule, xpad helper, and boot-time unbind service live under `/etc/`, which is overlayfs-backed on SteamOS. Steam's own files are never modified.
 
 If Steam ships an SDL update that includes the fix natively, re-run the install script (it's idempotent) to rebuild and verify.
 

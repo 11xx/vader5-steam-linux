@@ -28,12 +28,14 @@ mapping, not the cached display label.
 The working stack is:
 
 1. The udev rule unbinds `xpad` from the Vader's interface 0.
-2. Steam is launched through `~/.local/share/vader5-driver/wrapper.sh`.
-3. The wrapper uses `bubblewrap` to bind-mount patched SDL over Steam's bundled SDL.
-4. Patched SDL selects Flydigi HIDAPI on interface 1.
-5. Patched SDL sends the same Vader 5 init/test-mode sequence that padctl uses.
-6. The controller streams `5a a5 ef ...` extended reports.
-7. Steam Input sees the full button surface through SDL HIDAPI.
+2. The boot-time `vader5-xpad-unbind.service` handles dongles that were
+   already connected before the current login/session.
+3. Steam is launched through `~/.local/share/vader5-driver/wrapper.sh`.
+4. The wrapper uses `bubblewrap` to bind-mount patched SDL over Steam's bundled SDL.
+5. Patched SDL selects Flydigi HIDAPI on interface 1.
+6. Patched SDL sends the same Vader 5 init/test-mode sequence that padctl uses.
+7. The controller streams `5a a5 ef ...` extended reports.
+8. Steam Input sees the full button surface through SDL HIDAPI.
 
 This is deliberately not a userspace daemon or virtual Xbox/Elite controller.
 The controller stays visible to Steam as a real SDL HIDAPI gamepad with extended
@@ -236,7 +238,8 @@ After Steam finishes switching channels, close it and relaunch through
 
 - Flatpak Steam is not supported.
 - Steam UI labels can be stale; validate with `controller.txt`.
-- Replugging the dongle/controller is required after udev rule changes.
+- Replugging the dongle/controller should only be needed as a fallback if the
+  udev rule and boot-time xpad cleanup service did not run.
 - The fix depends on Steam using its bundled SDL path that the wrapper mounts.
 - If Steam updates its client SDL ABI again, rebuilding SDL `main` may be needed.
 - Game-specific Steam Input quirks can still exist even when the controller path
@@ -271,13 +274,20 @@ buttons when targeting stick clicks, then remove any duplicate subcommand if
 ## Reboot/Dongle Race
 
 If the dongle stays connected across reboot, Steam can sometimes show both the
-fixed HIDAPI controller and a generic Xbox controller until the dongle is
-replugged. The likely cause is `xpad` binding interface 0 before the local udev
-unbind rule has acted on the already-present USB device.
+fixed HIDAPI controller and a generic Xbox controller. The cause is `xpad`
+binding interface 0 before the original `ACTION=="add"` udev rule acted on the
+already-present USB device.
 
-This is separate from the rumble path. A later fix should make the wrapper run
-a preflight unbind for the current `37d7:2401` interface 0 before Steam starts,
-or strengthen the udev rule to cover the relevant `add`/`bind` timing.
+The fix has two parts:
+
+- The udev rule now also handles `ACTION=="bind"` for `xpad`.
+- The installer enables `vader5-xpad-unbind.service`, a root-owned oneshot
+  service that scans already-bound `37d7:2401` interface-0 entries at boot and
+  unbinds them before normal Steam use.
+
+This keeps everyday use rootless. Root is only needed at install time for the
+system udev/service files and for the boot-time sysfs write that a user session
+cannot safely perform.
 
 ## Useful Diagnostic Tools
 

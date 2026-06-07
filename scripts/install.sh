@@ -21,7 +21,12 @@ SDL_DEPLOY_DIR="$DEPLOY_DIR/sdl"
 WRAPPER_DST="$DEPLOY_DIR/wrapper.sh"
 UDEV_RULE_SRC="$REPO_ROOT/60-vader5-sdl.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/60-vader5-sdl.rules"
+UNBIND_HELPER_SRC="$REPO_ROOT/scripts/vader5-xpad-unbind.sh"
+UNBIND_HELPER_DST="/etc/vader5-driver/xpad-unbind.sh"
+UNBIND_SERVICE_SRC="$REPO_ROOT/systemd/vader5-xpad-unbind.service"
+UNBIND_SERVICE_DST="/etc/systemd/system/vader5-xpad-unbind.service"
 PATCH_FILE="$REPO_ROOT/sdl-flydigi-vader5-linux.patch"
+PATCH_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${BLUE}[info]${NC} $*"; }
@@ -300,6 +305,7 @@ SDL_CMAKE_COMMON=(
 
 _verify_sdl() {
     local lib="$1" bits="$2"
+    # shellcheck disable=SC2016 # Match literal RUNPATH=$ORIGIN.
     if ! readelf -d "$lib" 2>/dev/null | grep -q 'RUNPATH.*\$ORIGIN'; then
         warn "$lib is missing RUNPATH=\$ORIGIN — Steam's loader may not handle it correctly"
     fi
@@ -319,23 +325,75 @@ _find_sdl_versioned() {
     find "$1" -maxdepth 1 -name 'libSDL3.so.0.*' | head -1
 }
 
+PATCH_STAMP=""
+PATCH_CHANGED=0
+
+_flydigi_patch_current() {
+    local src="$1/src/joystick/hidapi/SDL_hidapi_flydigi.c"
+    grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' "$src" 2>/dev/null \
+        && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5' "$src" 2>/dev/null \
+        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null
+}
+
+_flydigi_patch_present() {
+    grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' \
+        "$1/src/joystick/hidapi/SDL_hidapi_flydigi.c" 2>/dev/null
+}
+
+_apply_flydigi_patch() {
+    info "Applying Flydigi Linux patch"
+    if ! patch -N -p1 -d "$SDL_SRC" < "$PATCH_FILE"; then
+        err "Patch failed to apply. The SDL source may be at a different version."
+        err "Check $PATCH_FILE against $SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c"
+        exit 1
+    fi
+    PATCH_CHANGED=1
+    ok "Patch applied"
+}
+
+_refresh_flydigi_patch() {
+    info "Refreshing Flydigi Linux patch in $SDL_SRC"
+    git -C "$SDL_SRC" checkout -- \
+        src/joystick/hidapi/SDL_hidapi_flydigi.c \
+        src/joystick/hidapi/SDL_hidapijoystick.c
+    _apply_flydigi_patch
+}
+
 # ── Wiring functions ──────────────────────────────────────────────────────────
 
 wire_service() {
     local override_dir="$HOME/.config/systemd/user/steam-launcher.service.d"
+    local override="$override_dir/override.conf"
+    local backup="$override.vader5-backup"
     mkdir -p "$override_dir"
-    cat > "$override_dir/override.conf" <<EOF
+
+    if [[ -f "$override" ]] \
+            && ! grep -q 'vader5-driver' "$override" 2>/dev/null \
+            && [[ ! -f "$backup" ]]; then
+        cp "$override" "$backup"
+        info "Backed up existing systemd override: $backup"
+    fi
+
+    cat > "$override" <<EOF
 [Service]
 ExecStart=
 ExecStart=$WRAPPER_DST
 EOF
     systemctl --user daemon-reload
-    ok "Systemd override installed: $override_dir/override.conf"
+    ok "Systemd override installed: $override"
 }
 
 wire_desktop() {
     local dst="$HOME/.local/share/applications/steam.desktop"
+    local backup="$dst.vader5-backup"
     mkdir -p "$(dirname "$dst")"
+
+    if [[ -f "$dst" ]] \
+            && ! grep -q 'vader5-driver' "$dst" 2>/dev/null \
+            && [[ ! -f "$backup" ]]; then
+        cp "$dst" "$backup"
+        info "Backed up existing .desktop override: $backup"
+    fi
 
     if [[ -n "$STEAM_DESKTOP_SRC" ]]; then
         awk -v wrapper="$WRAPPER_DST" '
@@ -410,32 +468,41 @@ else
     ok "SDL cloned"
 fi
 
-# Apply patch if the key symbol isn't already there
-if grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' \
-        "$SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c" 2>/dev/null; then
-    ok "Flydigi Linux patch already applied"
-else
-    info "Applying Flydigi Linux patch"
-    if ! patch -N -p1 -d "$SDL_SRC" < "$PATCH_FILE"; then
-        err "Patch failed to apply. The SDL source may be at a different version."
-        err "Check $PATCH_FILE against $SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c"
-        exit 1
+PATCH_STAMP="$SDL_SRC/.vader5-patch.sha256"
+PREVIOUS_PATCH_SHA="$(cat "$PATCH_STAMP" 2>/dev/null || true)"
+
+if [[ "${VADER5_REFRESH_SDL:-0}" == "1" ]]; then
+    _refresh_flydigi_patch
+elif _flydigi_patch_current "$SDL_SRC"; then
+    ok "Current Flydigi Linux patch already applied"
+    if [[ "$PREVIOUS_PATCH_SHA" != "$PATCH_SHA" ]]; then
+        PATCH_CHANGED=1
+        info "Patch stamp changed; SDL will be rebuilt"
     fi
-    ok "Patch applied"
+elif _flydigi_patch_present "$SDL_SRC"; then
+    err "SDL source has an older Vader patch: $SDL_SRC"
+    err "Re-run with VADER5_REFRESH_SDL=1 to restore the two patched SDL files"
+    err "from git and apply the current repo patch:"
+    err "  VADER5_REFRESH_SDL=1 bash scripts/install.sh"
+    exit 1
+else
+    _apply_flydigi_patch
 fi
 
 # ── 3. Build 64-bit SDL ───────────────────────────────────────────────────────
 SDL_BUILD64="$SDL_SRC/build-steam64"
 
-if [[ -f "$SDL_BUILD64/libSDL3.so.0" ]]; then
-    ok "64-bit SDL build already present at $SDL_BUILD64"
-else
+if [[ ! -f "$SDL_BUILD64/build.ninja" ]]; then
     info "Configuring 64-bit SDL (build dir: $SDL_BUILD64)"
     cmake -S "$SDL_SRC" -B "$SDL_BUILD64" \
         "${SDL_CMAKE_COMMON[@]}" \
         > /tmp/sdl-cmake64.log 2>&1 \
         || { err "cmake 64-bit failed — see /tmp/sdl-cmake64.log"; exit 1; }
+fi
 
+if [[ -f "$SDL_BUILD64/libSDL3.so.0" && "$PATCH_CHANGED" != "1" ]]; then
+    ok "64-bit SDL build already present at $SDL_BUILD64"
+else
     info "Building 64-bit SDL (this takes a few minutes)"
     cmake --build "$SDL_BUILD64" --target SDL3-shared -j"$(nproc)" \
         > /tmp/sdl-build64.log 2>&1 \
@@ -448,9 +515,7 @@ SDL_BUILD32="$SDL_SRC/build-steam32"
 
 install_x11_32
 
-if [[ -f "$SDL_BUILD32/libSDL3.so.0" ]]; then
-    ok "32-bit SDL build already present at $SDL_BUILD32"
-else
+if [[ ! -f "$SDL_BUILD32/build.ninja" ]]; then
     info "Configuring 32-bit SDL (build dir: $SDL_BUILD32)"
 
     CMAKE_32_EXTRA=(
@@ -481,7 +546,11 @@ else
         "${CMAKE_32_EXTRA[@]}" \
         > /tmp/sdl-cmake32.log 2>&1 \
         || { err "cmake 32-bit failed — see /tmp/sdl-cmake32.log"; exit 1; }
+fi
 
+if [[ -f "$SDL_BUILD32/libSDL3.so.0" && "$PATCH_CHANGED" != "1" ]]; then
+    ok "32-bit SDL build already present at $SDL_BUILD32"
+else
     info "Building 32-bit SDL (this takes a few minutes)"
     cmake --build "$SDL_BUILD32" --target SDL3-shared -j"$(nproc)" \
         > /tmp/sdl-build32.log 2>&1 \
@@ -498,6 +567,7 @@ SDL32_VERSIONED="$(_find_sdl_versioned "$SDL_BUILD32")"
 
 _verify_sdl "$SDL64_VERSIONED" 64
 _verify_sdl "$SDL32_VERSIONED" 32
+printf '%s\n' "$PATCH_SHA" > "$PATCH_STAMP"
 
 # ── 5. Deploy patched SDL ─────────────────────────────────────────────────────
 info "Deploying patched SDL to $SDL_DEPLOY_DIR"
@@ -664,7 +734,31 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ok "Udev rule installed"
 
-# ── 9. Restart Steam ──────────────────────────────────────────────────────────
+# ── 9. xpad boot/preflight unbind ─────────────────────────────────────────────
+info "Installing xpad unbind helper"
+
+sudo install -d -m 755 "$(dirname "$UNBIND_HELPER_DST")"
+sudo install -m 755 "$UNBIND_HELPER_SRC" "$UNBIND_HELPER_DST"
+
+if command -v systemctl &>/dev/null; then
+    sudo install -m 644 "$UNBIND_SERVICE_SRC" "$UNBIND_SERVICE_DST"
+    sudo systemctl daemon-reload
+    if sudo systemctl enable --now vader5-xpad-unbind.service; then
+        ok "xpad unbind service enabled"
+    else
+        warn "Could not enable vader5-xpad-unbind.service"
+    fi
+else
+    warn "systemctl not found; boot-time xpad cleanup service was not installed"
+fi
+
+if sudo "$UNBIND_HELPER_DST"; then
+    ok "Current Vader xpad binding cleaned up"
+else
+    warn "Could not run xpad unbind helper"
+fi
+
+# ── 10. Restart Steam ─────────────────────────────────────────────────────────
 if [[ "$WIRE_MODE" == "service" ]] \
         && systemctl --user is-active steam-launcher.service &>/dev/null; then
     info "Restarting steam-launcher.service"
@@ -683,14 +777,17 @@ echo ""
 echo "  Patched SDL:  $SDL_DEPLOY_DIR/"
 echo "  Wrapper:      $WRAPPER_DST"
 echo "  Udev rule:    $UDEV_RULE_DST"
+echo "  xpad helper:  $UNBIND_HELPER_DST"
+if command -v systemctl &>/dev/null; then
+    echo "  xpad service: $UNBIND_SERVICE_DST"
+fi
 case "$WIRE_MODE" in
     service) echo "  Systemd:      $HOME/.config/systemd/user/steam-launcher.service.d/override.conf" ;;
     desktop) echo "  Desktop:      $HOME/.local/share/applications/steam.desktop" ;;
 esac
 echo ""
 echo "Next steps:"
-echo "  1. Replug the Vader 5 Pro (or reconnect the 2.4G dongle) so the new"
-echo "     udev rule fires and unbinds xpad from interface 0."
+echo "  1. Start Steam through the installed launcher/wrapper."
 echo "  2. In Steam: Settings → Controller → Detected Controllers."
 echo "     The device should now appear as 'Flydigi Vader 5 Pro' (or similar)"
 echo "     rather than 'Generic X-Box pad'."

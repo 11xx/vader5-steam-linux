@@ -1,0 +1,11 @@
+[Unit]
+Description=Unbind xpad from Flydigi Vader 5 Pro interface 0
+After=systemd-udevd.service
+ConditionPathExists=/etc/vader5-driver/xpad-unbind.sh
+
+[Service]
+Type=oneshot
+ExecStart=/etc/vader5-driver/xpad-unbind.sh
+
+[Install]
+WantedBy=multi-user.target

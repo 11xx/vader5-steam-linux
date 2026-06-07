@@ -19,8 +19,15 @@
 KERNEL=="hidraw*", ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
     MODE="0660", GROUP="input", TAG+="uaccess"
 
-# 2. Unbind xpad from interface 0 on connect.
+# 2. Unbind xpad from interface 0 on connect and on driver bind. The bind rule
+#    closes the boot race where the dongle is already present and xpad attaches
+#    before Steam starts.
 ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="xpad", \
+    ATTR{bInterfaceNumber}=="00", \
+    ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
+    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/xpad/unbind'"
+
+ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="xpad", \
     ATTR{bInterfaceNumber}=="00", \
     ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
     RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/xpad/unbind'"
