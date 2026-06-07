@@ -204,11 +204,74 @@ files are only mounted over Steam's paths inside the wrapper namespace.
 - Game-specific Steam Input quirks can still exist even when the controller path
   is correct.
 
+## Open Rumble Work
+
+The currently validated Vader 5 Pro rumble packet is:
+
+```text
+5a a5 12 06 strong weak 00 00 00 00 ...
+```
+
+The SDL patch sends that command through the interface-1 raw write path, which
+is enough for normal SDL rumble and has been confirmed in Steam.
+
+The controller may have additional physical trigger motors, but the public
+padctl and flydigi-vader5 protocol notes only document the two `strong` and
+`weak` rumble bytes. The remaining bytes in the `0x12 0x06` payload are not
+mapped yet. Do not blindly expose SDL trigger rumble until those bytes are
+identified on hardware.
+
+Use `tools/vader5_rumble_probe.c` to sweep the rumble payload slots and record
+which physical motor responds:
+
+```sh
+cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
+
+# Close Steam first so it is not also writing HID packets.
+/tmp/vader5_rumble_probe /dev/hidrawN
+
+# If the undocumented slots do nothing, repeat with the checksum variant:
+/tmp/vader5_rumble_probe /dev/hidrawN --checksum
+```
+
+Report the physical result as slot numbers, for example `slot 0 = left grip`,
+`slot 1 = right grip`, `slot 2 = left trigger`. Once the trigger slots are
+known, SDL can advertise `SDL_JOYSTICK_CAP_TRIGGER_RUMBLE` and implement
+`HIDAPI_DriverFlydigi_RumbleJoystickTriggers()` for Vader 5 Pro only.
+
+## Steam Input UI Quirks
+
+Assigning extra buttons through Steam Input's normal picker writes a clean
+mapping and works reliably. The `Listen` assignment path can create redundant
+commands for some extra-button-to-stick-click mappings. This appears to be in
+Steam Input's layout editor rather than the SDL event stream: normal buttons
+map cleanly, while the extra Vader controls pass through Steam's generic
+`switches` source group and can be aliased with stick-click commands.
+
+The practical workaround is to use the picker/controller drawing for extra
+buttons when targeting stick clicks, then remove any duplicate subcommand if
+`Listen` created one.
+
+## Reboot/Dongle Race
+
+If the dongle stays connected across reboot, Steam can sometimes show both the
+fixed HIDAPI controller and a generic Xbox controller until the dongle is
+replugged. The likely cause is `xpad` binding interface 0 before the local udev
+unbind rule has acted on the already-present USB device.
+
+This is separate from the rumble path. A later fix should make the wrapper run
+a preflight unbind for the current `37d7:2401` interface 0 before Steam starts,
+or strengthen the udev rule to cover the relevant `add`/`bind` timing.
+
 ## Useful Diagnostic Tools
 
 `tools/vader5_raw_probe.c` writes the padctl-derived init/test-mode commands to
 a chosen `/dev/hidraw*` node and dumps raw reports. It is useful for confirming
 that the physical controller streams `5a a5 ef ...`.
+
+`tools/vader5_rumble_probe.c` sweeps the Vader 5 rumble payload bytes so the
+physical motor layout can be discovered safely before adding SDL trigger rumble
+support.
 
 `tools/sdl_event_probe.c` opens SDL gamepads and prints button/axis events. It
 is useful for checking whether SDL sees the extended buttons without relying on
@@ -218,6 +281,8 @@ Compile examples:
 
 ```sh
 cc tools/vader5_raw_probe.c -o /tmp/vader5_raw_probe
+
+cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
 
 cc tools/sdl_event_probe.c \
   -I$HOME/sdl-build/SDL-main-vader5/include \
