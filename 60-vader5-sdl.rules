@@ -9,25 +9,11 @@
 # What this file does:
 #   1. Grant the active session user read access to the Vader hidraw nodes
 #      so Steam's SDL HIDAPI can open the DInput interface (interface 1).
-#   2. Unbind xpad from the XInput interface (interface 0) so Steam sees
-#      only the Flydigi HIDAPI device and not a duplicate generic Xbox pad
-#      alongside it.  SDL HIDAPI reads from interface 1 via hidraw; xpad on
-#      interface 0 is unused and would confuse Steam's device deduplication.
+#   2. Leave xpad bound to the XInput interface (interface 0). The patched SDL
+#      hides that duplicate controller from Steam but uses its Linux FF endpoint
+#      as the Vader 5 Pro ordinary-rumble backend.
 
-# 1. hidraw access — TAG+="uaccess" grants an ACL to the active session user
-#    via systemd-logind, no manual group membership required.
+# hidraw access — TAG+="uaccess" grants an ACL to the active session user
+# via systemd-logind, no manual group membership required.
 KERNEL=="hidraw*", ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
     MODE="0660", GROUP="input", TAG+="uaccess"
-
-# 2. Unbind xpad from interface 0 on connect and on driver bind. The bind rule
-#    closes the boot race where the dongle is already present and xpad attaches
-#    before Steam starts.
-ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="xpad", \
-    ATTR{bInterfaceNumber}=="00", \
-    ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
-    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/xpad/unbind'"
-
-ACTION=="bind", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", DRIVER=="xpad", \
-    ATTR{bInterfaceNumber}=="00", \
-    ATTRS{idVendor}=="37d7", ATTRS{idProduct}=="2401", \
-    RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/xpad/unbind'"

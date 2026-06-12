@@ -8,7 +8,7 @@ Makes Steam detect the Vader 5 Pro natively via SDL's Flydigi HIDAPI driver, giv
 bash scripts/install.sh
 ```
 
-Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. It also installs the udev and boot-time xpad cleanup needed for already-connected dongles. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
+Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. It also installs the udev access rule and removes the legacy xpad-unbind helper. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
 
 For the debugging notes, confirmed behavior, and protocol findings behind this fix, see [FIX.md](FIX.md).
 
@@ -35,10 +35,10 @@ The Vader 5 Pro exposes two USB interfaces:
 
 | Interface | Driver | Protocol |
 |---|---|---|
-| 0 (XInput) | `xpad` kernel module | Standard Xbox HID report — 16 buttons, 6 axes |
+| 0 (XInput) | `xpad` kernel module | Standard Xbox input plus Linux `FF_RUMBLE` haptics |
 | 1 (DInput / Flydigi) | SDL HIDAPI | Vendor-specific 32-byte report, unnumbered, magic `5a a5 ef …` |
 
-All the extra inputs — M1–M4, LM, RM, C, Z, rumble — live on interface 1. Interface 0 knows nothing about them.
+The extra inputs — M1–M4, LM, RM, C, Z, gyro, and raw four-slot Flydigi rumble — live on interface 1. Interface 0 does not expose those inputs, but its xpad force-feedback path matches the controller's Xbox-compatible ordinary rumble behavior.
 
 SDL3's Flydigi HIDAPI driver was written for earlier controllers (Vader 2 Pro, Vader 3 Pro) and did not fully bring the Vader 5 Pro's interface 1 into its extended streaming mode on Linux. Without the fix, SDL either fails to parse the vendor reports or Steam falls back to interface 0 via `xpad`, so Steam sees a generic Xbox pad and the extra surface is not reliably remappable.
 
@@ -78,6 +78,7 @@ Inside the namespace, Steam's SDL paths resolve to our patched build. `steamui.s
 - **Raw 32-byte writes** — sends Vader 5 Pro commands as unnumbered 32-byte reports on interface 1.
 - **padctl-derived init/test mode** — sends the same init sequence and `5a a5 11 07 ... 15 00` enable command that padctl uses to make the controller stream `5a a5 ef ...` extended reports.
 - **Less brittle status handling** — keeps the HIDAPI device available after init instead of hiding it when the controller does not answer the older acquire flow.
+- **xpad haptics backend** — hides the Vader's duplicate xpad input device from SDL/Steam while privately using that same Linux `FF_RUMBLE` device for ordinary rumble. SDL trigger-rumble calls still use the raw Flydigi trigger slots.
 
 The existing SDL button mapping is then used for M1-M4, LM, RM, C, Z, and the other extended buttons.
 
@@ -89,15 +90,11 @@ If you override `SDL_REF`/`SDL_SRC` to build an older SDL tree that lacks the sy
 
 This repo is licensed under MIT. The included patch targets SDL, which is licensed upstream under zlib. If you redistribute patched SDL builds, preserve SDL's upstream notices as required by that project.
 
-### xpad unbind
+### xpad haptics backend
 
-Without the udev rule, `xpad` binds to interface 0 and Steam sees two controllers: a generic Xbox pad alongside the Flydigi HIDAPI device. `60-vader5-sdl.rules` fires on device add and driver bind, unbinds xpad from interface 0, and grants `hidraw` access so Steam can open interface 1 without root.
+The old version of this fix unbound `xpad` from interface 0 to avoid a duplicate generic Xbox controller. That made the full Flydigi button surface work, but it also removed the kernel force-feedback path that the controller firmware uses for its Xbox-compatible rumble behavior.
 
-The installer also installs `/etc/vader5-driver/xpad-unbind.sh` and enables
-`vader5-xpad-unbind.service`. That oneshot service scans already-connected
-dongles at boot and unbinds xpad from the Vader's interface 0. This closes the
-common reboot race where the dongle is present before the udev rule gets a
-fresh hotplug event.
+The current patch leaves `xpad` bound, teaches SDL's HIDAPI layer to own the Vader 5 Pro as the visible controller, and suppresses the duplicate Linux/xpad joystick. Ordinary rumble is sent through the hidden xpad `FF_RUMBLE` event device when available, falling back to the raw Flydigi grip-rumble packet if it is not.
 
 ## File layout
 
@@ -117,8 +114,6 @@ fresh hotplug event.
 ~/.local/share/applications/steam.desktop
 
 /etc/udev/rules.d/60-vader5-sdl.rules
-/etc/vader5-driver/xpad-unbind.sh
-/etc/systemd/system/vader5-xpad-unbind.service
 ```
 
 Nothing is written under `/usr`, `/usr/local`, or Steam's own file tree.
@@ -152,7 +147,7 @@ On SteamOS, run `passwd` first if you haven't set a sudo password.
 
 ## Survives updates?
 
-Yes. The patched SDL and wrapper live in `~/.local/share/vader5-driver/` and the systemd or desktop wiring lives in `~/.config/` or `~/.local/share/applications/` — all of which persist across Steam updates and SteamOS A/B partition updates. The udev rule, xpad helper, and boot-time unbind service live under `/etc/`, which is overlayfs-backed on SteamOS. Steam's own files are never modified.
+Yes. The patched SDL and wrapper live in `~/.local/share/vader5-driver/` and the systemd or desktop wiring lives in `~/.config/` or `~/.local/share/applications/` — all of which persist across Steam updates and SteamOS A/B partition updates. The udev rule lives under `/etc/`, which is overlayfs-backed on SteamOS. Steam's own files are never modified.
 
 If Steam ships an SDL update that includes the fix natively, re-run the install script (it's idempotent) to rebuild and verify.
 
@@ -190,7 +185,7 @@ Required changes:
 - **SDL must include the Vader 5 Pro Linux fix.** The Flydigi HIDAPI backend needs to select interface 1, send the init/test-mode sequence, and handle the controller's unnumbered fixed-size 32-byte reports for input, status, and rumble/output writes.
 - **Steam must ship a Linux client build that includes that SDL fix.** It is not enough for the patch to exist upstream in SDL; the Steam client on Linux has to actually bundle and use it.
 - **Linux-side access to the real Flydigi `hidraw` interface must work without local overrides.** If Steam cannot open the controller's vendor HID interface as the logged-in user, the local udev rule is still needed.
-- **The generic `xpad` path must stop winning over the real Flydigi HID path.** If Steam still falls back to the Xbox-facing interface first, the local `xpad` unbind rule is still needed.
+- **The generic `xpad` path must stop winning over the real Flydigi HID path.** The local SDL patch currently hides the duplicate xpad joystick while keeping xpad available for haptics.
 
 Who needs to change what:
 
@@ -202,7 +197,7 @@ Who needs to change what:
 
 **Controller still shows as Generic X-Box pad after install:**
 
-1. Replug the controller — the udev xpad-unbind rule only fires on device add.
+1. Replug or power-cycle the controller so both the xpad and hidraw interfaces are present.
 2. Confirm the wrapper is active:
    ```sh
    systemctl --user status steam-launcher.service | grep ExecStart
@@ -214,17 +209,17 @@ Who needs to change what:
    grep libSDL3 /proc/$pid/maps | sort -u
    # Should show vader5-driver/sdl/libSDL3-32.so.0
    ```
-3. Confirm xpad is unbound:
+3. Confirm xpad is bound:
    ```sh
    ls /sys/bus/usb/drivers/xpad/
-   # Should NOT show the Vader's interface (e.g. 3-1:1.0)
+   # Should show the Vader's interface (e.g. 3-1:1.0)
    ```
 4. Check Steam's controller log:
    ```sh
    grep -n 'Flydigi\|Vader\|HIDAPI' ~/.local/share/Steam/logs/controller.txt | tail -40
    ```
 
-`evtest` is not the success test for this mode. The udev rule intentionally unbinds `xpad` from interface 0, so the real controller path is Steam/SDL HIDAPI through `/dev/hidraw*`, not a kernel `/dev/input/event*` Xbox device.
+The visible Steam controller should still be the Flydigi HIDAPI controller, not the generic xpad device. The xpad event node is kept only as the ordinary-rumble backend.
 
 **Build fails at 32-bit cmake:**
 

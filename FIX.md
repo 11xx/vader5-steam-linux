@@ -11,13 +11,16 @@ The controller works through Steam Input using SDL HIDAPI, including:
 - Extra surface exposed by SDL/Steam: M1-M4, LM, RM, C, Z, and related misc buttons.
 - Steam Input remapping for paddles and extra buttons.
 - Gyro and extended settings visible in Steam's controller UI.
-- Rumble, after routing Vader 5 Pro V2 rumble through the raw interface-1 write path.
+- Ordinary rumble routed through the hidden xpad Linux `FF_RUMBLE` path, with
+  raw Flydigi trigger-rumble slots still exposed for callers that use SDL's
+  trigger-rumble API.
 
 Validated manually with:
 
 - Warhammer: Vermintide 2: controller input, Steam Input remapping, paddles, and extra buttons worked.
 - Elden Ring Nightreign: initially behaved inconsistently, then worked after the final deployed build.
-- Rumble confirmed working after the V2 raw-rumble fix.
+- Rumble confirmed working after the V2 raw-rumble fix; later usbmon captures
+  showed the game's working trigger-feel path is ordinary xpad rumble.
 
 Steam may still show a stale or generic UI label in some places. The reliable
 validation is the Steam controller log showing the HIDAPI device and full
@@ -27,15 +30,15 @@ mapping, not the cached display label.
 
 The working stack is:
 
-1. The udev rule unbinds `xpad` from the Vader's interface 0.
-2. The boot-time `vader5-xpad-unbind.service` handles dongles that were
-   already connected before the current login/session.
-3. Steam is launched through `~/.local/share/vader5-driver/wrapper.sh`.
-4. The wrapper uses `bubblewrap` to bind-mount patched SDL over Steam's bundled SDL.
-5. Patched SDL selects Flydigi HIDAPI on interface 1.
+1. `xpad` remains bound to the Vader's interface 0 for Linux force feedback.
+2. Steam is launched through `~/.local/share/vader5-driver/wrapper.sh`.
+3. The wrapper uses `bubblewrap` to bind-mount patched SDL over Steam's bundled SDL.
+4. Patched SDL selects Flydigi HIDAPI on interface 1.
+5. Patched SDL hides the duplicate xpad joystick from SDL/Steam.
 6. Patched SDL sends the same Vader 5 init/test-mode sequence that padctl uses.
 7. The controller streams `5a a5 ef ...` extended reports.
 8. Steam Input sees the full button surface through SDL HIDAPI.
+9. Ordinary rumble is sent through the hidden xpad event device when available.
 
 This is deliberately not a userspace daemon or virtual Xbox/Elite controller.
 The controller stays visible to Steam as a real SDL HIDAPI gamepad with extended
@@ -78,21 +81,21 @@ Good signs:
 - Mapping includes `paddle1` through `paddle4`
 - Mapping includes `misc2` through `misc6`
 
-Confirm `xpad` is not owning interface 0:
+Confirm `xpad` is owning interface 0:
 
 ```sh
-ls /sys/bus/usb/drivers/xpad/ | grep ':1.0' || true
+ls /sys/bus/usb/drivers/xpad/ | grep ':1.0'
 ```
 
-For the Vader's USB path, interface `:1.0` should not be bound to `xpad`.
+For the Vader's USB path, interface `:1.0` should be bound to `xpad`.
 
 ## What Not To Trust
 
-`evtest` is not the success test for this setup.
+`evtest` alone is not the success test for this setup.
 
-The whole point of the udev rule is to stop the kernel `xpad` path from winning
-and let Steam's SDL HIDAPI path own interface 1. When this fix is working, a
-normal `/dev/input/event*` Xbox-style controller may be absent or irrelevant.
+The xpad `/dev/input/event*` device is intentionally present for force
+feedback, but it should not be the controller Steam exposes. Steam should use
+the SDL HIDAPI device on interface 1 for input and Steam Input mapping.
 
 Steam's display label can also be stale or misleading. A UI label like
 `Generic X-Box pad` does not necessarily mean the fix failed if the controller
@@ -238,8 +241,8 @@ After Steam finishes switching channels, close it and relaunch through
 
 - Flatpak Steam is not supported.
 - Steam UI labels can be stale; validate with `controller.txt`.
-- Replugging the dongle/controller should only be needed as a fallback if the
-  udev rule and boot-time xpad cleanup service did not run.
+- Replugging or power-cycling the controller may be needed if the xpad or
+  hidraw interface was already in a stale state before install.
 - The fix depends on Steam using its bundled SDL path that the wrapper mounts.
 - If Steam updates its client SDL ABI again, rebuilding SDL `main` may be needed.
 - Game-specific Steam Input quirks can still exist even when the controller path
@@ -265,11 +268,18 @@ The confirmed Vader 5 Pro rumble command payload is:
 ```
 
 Steam does not reliably send SDL's separate trigger-rumble call for games that
-only expose ordinary two-motor rumble. The patched SDL does not mirror ordinary
-rumble into the trigger motors: slots 0/1 are driven by `SDL_RumbleGamepad`,
-and slots 2/3 are driven only by `SDL_RumbleGamepadTriggers`. If grip rumble
-works but trigger rumble does not in Steam, the missing piece is Steam/Input
-choosing not to call SDL's trigger-rumble path for that device or game layer.
+only expose ordinary two-motor rumble. usbmon captures from the working xpad
+state showed the game sending compact xpad packets shaped like:
+
+```text
+00 08 00 left right 00 00 00
+```
+
+That means the observed trigger feel comes from the controller firmware's
+Xbox-compatible ordinary-rumble behavior, not independent trigger-rumble data.
+The patched SDL therefore sends ordinary rumble through the hidden xpad
+`FF_RUMBLE` device when available. SDL trigger-rumble calls still use raw
+Flydigi slots 2/3.
 
 `tools/sdl_rumble_probe.c` tests the deployed SDL path rather than raw hidraw:
 
@@ -302,23 +312,13 @@ The practical workaround is to use the picker/controller drawing for extra
 buttons when targeting stick clicks, then remove any duplicate subcommand if
 `Listen` created one.
 
-## Reboot/Dongle Race
+## Duplicate xpad Device
 
-If the dongle stays connected across reboot, Steam can sometimes show both the
-fixed HIDAPI controller and a generic Xbox controller. The cause is `xpad`
-binding interface 0 before the original `ACTION=="add"` udev rule acted on the
-already-present USB device.
-
-The fix has two parts:
-
-- The udev rule now also handles `ACTION=="bind"` for `xpad`.
-- The installer enables `vader5-xpad-unbind.service`, a root-owned oneshot
-  service that scans already-bound `37d7:2401` interface-0 entries at boot and
-  unbinds them before normal Steam use.
-
-This keeps everyday use rootless. Root is only needed at install time for the
-system udev/service files and for the boot-time sysfs write that a user session
-cannot safely perform.
+The old fix unbound xpad to avoid Steam showing both the HIDAPI controller and
+a generic Xbox controller. The current fix keeps xpad bound for haptics and
+patches SDL so the Linux/xpad joystick is considered handled by the higher
+priority HIDAPI driver. Root is only needed at install time for the udev rule
+and deployed files.
 
 ## Useful Diagnostic Tools
 

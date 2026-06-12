@@ -21,9 +21,7 @@ SDL_DEPLOY_DIR="$DEPLOY_DIR/sdl"
 WRAPPER_DST="$DEPLOY_DIR/wrapper.sh"
 UDEV_RULE_SRC="$REPO_ROOT/60-vader5-sdl.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/60-vader5-sdl.rules"
-UNBIND_HELPER_SRC="$REPO_ROOT/scripts/vader5-xpad-unbind.sh"
 UNBIND_HELPER_DST="/etc/vader5-driver/xpad-unbind.sh"
-UNBIND_SERVICE_SRC="$REPO_ROOT/systemd/vader5-xpad-unbind.service"
 UNBIND_SERVICE_DST="/etc/systemd/system/vader5-xpad-unbind.service"
 PATCH_FILE="$REPO_ROOT/sdl-flydigi-vader5-linux.patch"
 PATCH_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
@@ -332,6 +330,7 @@ _flydigi_patch_current() {
     local src="$1/src/joystick/hidapi/SDL_hidapi_flydigi.c"
     grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' "$src" 2>/dev/null \
         && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5' "$src" 2>/dev/null \
+        && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5Xpad' "$src" 2>/dev/null \
         && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null
 }
 
@@ -685,6 +684,7 @@ for _f in "$SDL32" "$SDL64"; do
 done
 
 export SDL_JOYSTICK_HIDAPI=1
+export SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE="${SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE:-1}"
 unset SDL_GAMECONTROLLERCONFIG
 
 ARGS=(
@@ -734,29 +734,16 @@ sudo udevadm control --reload-rules
 sudo udevadm trigger
 ok "Udev rule installed"
 
-# ── 9. xpad boot/preflight unbind ─────────────────────────────────────────────
-info "Installing xpad unbind helper"
-
-sudo install -d -m 755 "$(dirname "$UNBIND_HELPER_DST")"
-sudo install -m 755 "$UNBIND_HELPER_SRC" "$UNBIND_HELPER_DST"
+# ── 9. Legacy xpad unbind cleanup ─────────────────────────────────────────────
+info "Removing legacy xpad unbind helper"
 
 if command -v systemctl &>/dev/null; then
-    sudo install -m 644 "$UNBIND_SERVICE_SRC" "$UNBIND_SERVICE_DST"
+    sudo systemctl disable --now vader5-xpad-unbind.service 2>/dev/null || true
+    sudo rm -f "$UNBIND_SERVICE_DST"
     sudo systemctl daemon-reload
-    if sudo systemctl enable --now vader5-xpad-unbind.service; then
-        ok "xpad unbind service enabled"
-    else
-        warn "Could not enable vader5-xpad-unbind.service"
-    fi
-else
-    warn "systemctl not found; boot-time xpad cleanup service was not installed"
 fi
-
-if sudo "$UNBIND_HELPER_DST"; then
-    ok "Current Vader xpad binding cleaned up"
-else
-    warn "Could not run xpad unbind helper"
-fi
+sudo rm -f "$UNBIND_HELPER_DST"
+ok "xpad left bound for Vader 5 haptics backend"
 
 # ── 10. Restart Steam ─────────────────────────────────────────────────────────
 if [[ "$WIRE_MODE" == "service" ]] \
@@ -777,10 +764,6 @@ echo ""
 echo "  Patched SDL:  $SDL_DEPLOY_DIR/"
 echo "  Wrapper:      $WRAPPER_DST"
 echo "  Udev rule:    $UDEV_RULE_DST"
-echo "  xpad helper:  $UNBIND_HELPER_DST"
-if command -v systemctl &>/dev/null; then
-    echo "  xpad service: $UNBIND_SERVICE_DST"
-fi
 case "$WIRE_MODE" in
     service) echo "  Systemd:      $HOME/.config/systemd/user/steam-launcher.service.d/override.conf" ;;
     desktop) echo "  Desktop:      $HOME/.local/share/applications/steam.desktop" ;;

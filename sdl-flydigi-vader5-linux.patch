@@ -1,8 +1,26 @@
 diff --git a/src/joystick/hidapi/SDL_hidapi_flydigi.c b/src/joystick/hidapi/SDL_hidapi_flydigi.c
-index 989609c..a3f39f9 100644
+index 989609c..1f07d86 100644
 --- a/src/joystick/hidapi/SDL_hidapi_flydigi.c
 +++ b/src/joystick/hidapi/SDL_hidapi_flydigi.c
-@@ -78,7 +78,11 @@ enum
+@@ -27,6 +27,17 @@
+ #include "SDL_hidapi_rumble.h"
+ #include "SDL_hidapi_flydigi.h"
+ 
++#ifdef SDL_PLATFORM_LINUX
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <limits.h>
++#include <linux/input.h>
++#include <sys/ioctl.h>
++#include <unistd.h>
++#include "../../core/linux/SDL_evdev_capabilities.h"
++#endif
++
+ #ifdef SDL_JOYSTICK_HIDAPI_FLYDIGI
+ 
+ // Define this if you want to log all packets from the controller
+@@ -78,7 +89,13 @@ enum
  #define FLYDIGI_V2_SET_STATUS_COMMAND   0x11
  #define FLYDIGI_V2_HAPTIC_COMMAND       0x12
  #define FLYDIGI_V2_ACQUIRE_CONTROLLER_COMMAND 0x1C
@@ -11,10 +29,12 @@ index 989609c..a3f39f9 100644
 +#define FLYDIGI_V2_TEST_MODE_LENGTH     0x07
 +#define FLYDIGI_V2_TEST_MODE_ENABLE     0x15
 +#define FLYDIGI_V2_TEST_MODE_DISABLE    0x14
++
++#define SDL_HINT_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE "SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE"
  
  typedef struct
  {
-@@ -98,6 +102,10 @@ typedef struct
+@@ -98,6 +115,14 @@ typedef struct
      float gyroScale;
      Uint64 next_heartbeat;
      Uint64 last_packet;
@@ -22,10 +42,14 @@ index 989609c..a3f39f9 100644
 +    Uint8 rumble_right_grip;
 +    Uint8 rumble_left_trigger;
 +    Uint8 rumble_right_trigger;
++#ifdef SDL_PLATFORM_LINUX
++    int vader5_xpad_fd;
++    struct ff_effect vader5_xpad_effect;
++#endif
      Uint8 last_state[USB_PACKET_LENGTH];
  } SDL_DriverFlydigi_Context;
  
-@@ -299,14 +307,16 @@ static int HIDAPI_DriverFlydigi_WritePacket(SDL_HIDAPI_Device *device, const Uin
+@@ -299,14 +324,16 @@ static int HIDAPI_DriverFlydigi_WritePacket(SDL_HIDAPI_Device *device, const Uin
  {
      // We know that at the very least the Vader 5 now uses unnumbered reports for commands instead of FLYDIGI_V2_CMD_REPORT_ID.
      // If other Flydigi things prove to do the same, we can tweak this check to be more general.
@@ -48,7 +72,7 @@ index 989609c..a3f39f9 100644
      }
  
      return SDL_hid_write(device->dev, data, size);
-@@ -415,7 +425,7 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
+@@ -415,7 +442,7 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
          FLYDIGI_V2_MAGIC2,
          FLYDIGI_V2_GET_INFO_COMMAND,
          2,
@@ -57,7 +81,7 @@ index 989609c..a3f39f9 100644
      };
  
      if (HIDAPI_DriverFlydigi_WritePacket(device, cmd, sizeof(cmd)) < 0) {
-@@ -424,6 +434,23 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
+@@ -424,6 +451,23 @@ static bool SDL_HIDAPI_Flydigi_SendInfoRequest(SDL_HIDAPI_Device *device)
      return true;
  }
  
@@ -81,7 +105,7 @@ index 989609c..a3f39f9 100644
  static void HIDAPI_DriverFlydigi_HandleInfoResponse(SDL_Joystick *joystick, SDL_DriverFlydigi_Context *ctx, Uint8 *data, int size)
  {
      SDL_PowerState state;
-@@ -471,36 +498,34 @@ static void HIDAPI_DriverFlydigi_HandleStatusResponse(SDL_HIDAPI_Device *device,
+@@ -471,36 +515,34 @@ static void HIDAPI_DriverFlydigi_HandleStatusResponse(SDL_HIDAPI_Device *device,
  {
      if (data[9] == 1) {
          HIDAPI_DriverFlydigi_SetAvailable(device, true);
@@ -129,7 +153,7 @@ index 989609c..a3f39f9 100644
  }
  
  static bool HIDAPI_DriverFlydigi_InitControllerV2(SDL_HIDAPI_Device *device)
-@@ -552,8 +577,12 @@ static bool HIDAPI_DriverFlydigi_InitControllerV2(SDL_HIDAPI_Device *device)
+@@ -552,8 +594,12 @@ static bool HIDAPI_DriverFlydigi_InitControllerV2(SDL_HIDAPI_Device *device)
  
      HIDAPI_DriverFlydigi_UpdateDeviceIdentity(device);
  
@@ -144,21 +168,153 @@ index 989609c..a3f39f9 100644
  
      return true;
  }
-@@ -618,6 +647,8 @@ static bool HIDAPI_DriverFlydigi_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joy
+@@ -565,6 +611,10 @@ static bool HIDAPI_DriverFlydigi_InitDevice(SDL_HIDAPI_Device *device)
+         return false;
+     }
+     ctx->device = device;
++#ifdef SDL_PLATFORM_LINUX
++    ctx->vader5_xpad_fd = -1;
++    ctx->vader5_xpad_effect.id = -1;
++#endif
+ 
+     device->context = ctx;
+ 
+@@ -618,6 +668,122 @@ static bool HIDAPI_DriverFlydigi_OpenJoystick(SDL_HIDAPI_Device *device, SDL_Joy
      return true;
  }
  
++#ifdef SDL_PLATFORM_LINUX
++static bool HIDAPI_DriverFlydigi_IsVader5XpadEvent(const char *event_name, int fd)
++{
++    struct input_id inpid;
++    unsigned long ffbit[NBITS(FF_MAX)] = { 0 };
++    char link_path[PATH_MAX];
++    char link_target[PATH_MAX];
++    ssize_t link_len;
++
++    if (ioctl(fd, EVIOCGID, &inpid) < 0) {
++        return false;
++    }
++    if (inpid.vendor != USB_VENDOR_FLYDIGI_V2 || inpid.product != USB_PRODUCT_FLYDIGI_V2_VADER) {
++        return false;
++    }
++    if (ioctl(fd, EVIOCGBIT(EV_FF, sizeof(ffbit)), ffbit) < 0 || !test_bit(FF_RUMBLE, ffbit)) {
++        return false;
++    }
++
++    (void)SDL_snprintf(link_path, sizeof(link_path), "/sys/class/input/%s/device", event_name);
++    link_len = readlink(link_path, link_target, sizeof(link_target) - 1);
++    if (link_len < 0) {
++        return false;
++    }
++    link_target[link_len] = '\0';
++
++    return SDL_strstr(link_target, ":1.0/") != NULL || SDL_strstr(link_target, ":1.0") != NULL;
++}
++
++static void HIDAPI_DriverFlydigi_CloseVader5XpadRumble(SDL_DriverFlydigi_Context *ctx)
++{
++    if (ctx->vader5_xpad_fd >= 0) {
++        close(ctx->vader5_xpad_fd);
++        ctx->vader5_xpad_fd = -1;
++        ctx->vader5_xpad_effect.id = -1;
++    }
++}
++
++static bool HIDAPI_DriverFlydigi_OpenVader5XpadRumble(SDL_DriverFlydigi_Context *ctx)
++{
++    DIR *dir;
++    struct dirent *entry;
++
++    if (ctx->vader5_xpad_fd >= 0) {
++        return true;
++    }
++
++    dir = opendir("/dev/input");
++    if (!dir) {
++        return false;
++    }
++
++    while ((entry = readdir(dir)) != NULL) {
++        char path[PATH_MAX];
++        int fd;
++
++        if (SDL_strncmp(entry->d_name, "event", 5) != 0) {
++            continue;
++        }
++
++        (void)SDL_snprintf(path, sizeof(path), "/dev/input/%s", entry->d_name);
++        fd = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK, 0);
++        if (fd < 0) {
++            continue;
++        }
++
++        if (HIDAPI_DriverFlydigi_IsVader5XpadEvent(entry->d_name, fd)) {
++            ctx->vader5_xpad_fd = fd;
++            SDL_zero(ctx->vader5_xpad_effect);
++            ctx->vader5_xpad_effect.id = -1;
++            closedir(dir);
++            return true;
++        }
++
++        close(fd);
++    }
++
++    closedir(dir);
++    return false;
++}
++
++static bool HIDAPI_DriverFlydigi_RumbleVader5Xpad(SDL_DriverFlydigi_Context *ctx, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
++{
++    struct input_event event;
++
++    if (!HIDAPI_DriverFlydigi_OpenVader5XpadRumble(ctx)) {
++        return false;
++    }
++
++    ctx->vader5_xpad_effect.type = FF_RUMBLE;
++    ctx->vader5_xpad_effect.replay.length = SDL_MAX_RUMBLE_DURATION_MS;
++    ctx->vader5_xpad_effect.u.rumble.strong_magnitude = low_frequency_rumble;
++    ctx->vader5_xpad_effect.u.rumble.weak_magnitude = high_frequency_rumble;
++
++    if (ioctl(ctx->vader5_xpad_fd, EVIOCSFF, &ctx->vader5_xpad_effect) < 0) {
++        ctx->vader5_xpad_effect.id = -1;
++        if (ioctl(ctx->vader5_xpad_fd, EVIOCSFF, &ctx->vader5_xpad_effect) < 0) {
++            HIDAPI_DriverFlydigi_CloseVader5XpadRumble(ctx);
++            return false;
++        }
++    }
++
++    SDL_zero(event);
++    event.type = EV_FF;
++    event.code = ctx->vader5_xpad_effect.id;
++    event.value = 1;
++    if (write(ctx->vader5_xpad_fd, &event, sizeof(event)) < 0) {
++        HIDAPI_DriverFlydigi_CloseVader5XpadRumble(ctx);
++        return false;
++    }
++    return true;
++}
++#endif
++
 +static bool HIDAPI_DriverFlydigi_RumbleVader5(SDL_HIDAPI_Device *device);
 +
  static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint16 low_frequency_rumble, Uint16 high_frequency_rumble)
  {
      if (device->vendor_id == USB_VENDOR_FLYDIGI_V1) {
-@@ -629,6 +660,14 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
+@@ -629,6 +795,21 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
              return SDL_SetError("Couldn't send rumble packet");
          }
      } else {
 +        if (device->product_id == USB_PRODUCT_FLYDIGI_V2_VADER && device->interface_number == 1) {
 +            SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
++
++#ifdef SDL_PLATFORM_LINUX
++            if (SDL_GetHintBoolean(SDL_HINT_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE, true) &&
++                HIDAPI_DriverFlydigi_RumbleVader5Xpad(ctx, low_frequency_rumble, high_frequency_rumble)) {
++                return true;
++            }
++#endif
 +
 +            ctx->rumble_left_grip = low_frequency_rumble >> 8;
 +            ctx->rumble_right_grip = high_frequency_rumble >> 8;
@@ -168,7 +324,7 @@ index 989609c..a3f39f9 100644
          Uint8 rumble_packet[] = { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, FLYDIGI_V2_HAPTIC_COMMAND, 6, 0, 0, 0, 0, 0 };
          rumble_packet[5] = low_frequency_rumble >> 8;
          rumble_packet[6] = high_frequency_rumble >> 8;
-@@ -640,14 +679,43 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
+@@ -640,14 +821,43 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
      return true;
  }
  
@@ -213,7 +369,7 @@ index 989609c..a3f39f9 100644
  }
  
  static bool HIDAPI_DriverFlydigi_SetJoystickLED(SDL_HIDAPI_Device *device, SDL_Joystick *joystick, Uint8 red, Uint8 green, Uint8 blue)
-@@ -1004,7 +1079,7 @@ static bool HIDAPI_DriverFlydigi_UpdateDevice(SDL_HIDAPI_Device *device)
+@@ -1004,7 +1214,7 @@ static bool HIDAPI_DriverFlydigi_UpdateDevice(SDL_HIDAPI_Device *device)
  
      if (device->vendor_id == USB_VENDOR_FLYDIGI_V2 && joystick) {
          if (!ctx->next_heartbeat || now >= ctx->next_heartbeat) {
@@ -222,7 +378,7 @@ index 989609c..a3f39f9 100644
              SDL_HIDAPI_Flydigi_SendInfoRequest(device);
              ctx->next_heartbeat = now + FLYDIGI_ACQUIRE_CONTROLLER_HEARTBEAT_TIME;
          }
-@@ -1042,7 +1117,7 @@ static void HIDAPI_DriverFlydigi_CloseJoystick(SDL_HIDAPI_Device *device, SDL_Jo
+@@ -1042,11 +1252,18 @@ static void HIDAPI_DriverFlydigi_CloseJoystick(SDL_HIDAPI_Device *device, SDL_Jo
  {
      // Don't unacquire the controller, someone else might be using it too.
      // The controller will automatically unacquire itself after a little while
@@ -231,8 +387,19 @@ index 989609c..a3f39f9 100644
  }
  
  static void HIDAPI_DriverFlydigi_FreeDevice(SDL_HIDAPI_Device *device)
+ {
++#ifdef SDL_PLATFORM_LINUX
++    SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
++
++    if (ctx) {
++        HIDAPI_DriverFlydigi_CloseVader5XpadRumble(ctx);
++    }
++#endif
+ }
+ 
+ SDL_HIDAPI_DeviceDriver SDL_HIDAPI_DriverFlydigi = {
 diff --git a/src/joystick/hidapi/SDL_hidapijoystick.c b/src/joystick/hidapi/SDL_hidapijoystick.c
-index c8bca94..7fc06cc 100644
+index c8bca94..182cdaa 100644
 --- a/src/joystick/hidapi/SDL_hidapijoystick.c
 +++ b/src/joystick/hidapi/SDL_hidapijoystick.c
 @@ -382,6 +382,12 @@ static SDL_HIDAPI_DeviceDriver *HIDAPI_GetDeviceDriver(SDL_HIDAPI_Device *device
@@ -248,3 +415,22 @@ index c8bca94..7fc06cc 100644
      for (i = 0; i < SDL_arraysize(SDL_HIDAPI_drivers); ++i) {
          SDL_HIDAPI_DeviceDriver *driver = SDL_HIDAPI_drivers[i];
          if (driver->enabled && driver->IsSupportedDevice(device, device->name, device->type, device->vendor_id, device->product_id, device->version, device->interface_number, device->interface_class, device->interface_subclass, device->interface_protocol)) {
+@@ -1319,13 +1325,11 @@ bool HIDAPI_IsDevicePresent(Uint16 vendor_id, Uint16 product_id, Uint16 version,
+      */
+     SDL_LockJoysticks();
+     for (device = SDL_HIDAPI_devices; device; device = device->next) {
+-        // The HIDAPI functionality will be available when the FlyDigi Space Station app has
+-        // enabled third party controller mapping, so the driver needs to be active to watch
+-        // for that change. Since this is dynamic and we don't have a way to re-trigger device
+-        // changes when that happens, we'll pretend the driver isn't available so the XInput
+-        // interface will always show up (but won't have any input when the controller is in
+-        // enhanced mode)
+-        if (device->vendor_id == USB_VENDOR_FLYDIGI_V2) {
++        // Older Flydigi V2 devices may need their XInput interface visible while
++        // third-party mapping is toggled. Vader 5 Pro is handled by HIDAPI on
++        // interface 1, with the xpad interface used only as a hidden FF backend.
++        if (device->vendor_id == USB_VENDOR_FLYDIGI_V2 &&
++            device->product_id != USB_PRODUCT_FLYDIGI_V2_VADER) {
+             continue;
+         }
+ 
