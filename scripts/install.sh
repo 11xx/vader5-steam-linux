@@ -332,7 +332,8 @@ _flydigi_patch_current() {
     local src="$1/src/joystick/hidapi/SDL_hidapi_flydigi.c"
     grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' "$src" 2>/dev/null \
         && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5' "$src" 2>/dev/null \
-        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null
+        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null \
+        && grep -q 'SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE' "$src" 2>/dev/null
 }
 
 _flydigi_patch_present() {
@@ -685,6 +686,7 @@ for _f in "$SDL32" "$SDL64"; do
 done
 
 export SDL_JOYSTICK_HIDAPI=1
+export SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE="${SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE:-1}"
 unset SDL_GAMECONTROLLERCONFIG
 
 ARGS=(

@@ -258,6 +258,42 @@ cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
 /tmp/vader5_rumble_probe /dev/hidrawN
 ```
 
+The confirmed Vader 5 Pro rumble command payload is:
+
+```text
+5a a5 12 06 left_grip right_grip left_trigger right_trigger 00 00 ...
+```
+
+Steam does not reliably send SDL's separate trigger-rumble call for games that
+only expose ordinary XInput-style rumble. To make those games use all four
+Vader motors, the patched SDL mirrors ordinary left/right rumble onto the
+left/right trigger motors by default. Native trigger rumble is still supported;
+when both paths are active, the driver sends the stronger value for each
+trigger. Set this before launching Steam to disable the compatibility mirror:
+
+```sh
+SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE=0 \
+  ~/.local/share/vader5-driver/wrapper.sh
+```
+
+`tools/sdl_rumble_probe.c` tests the deployed SDL path rather than raw hidraw:
+
+```sh
+rm -rf /tmp/vader5-sdl-probe-lib
+mkdir -p /tmp/vader5-sdl-probe-lib
+ln -s "$HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0" \
+  /tmp/vader5-sdl-probe-lib/libSDL3.so.0
+
+cc tools/sdl_rumble_probe.c \
+  -I/home/lobo/sdl-build/SDL-main-vader5/include \
+  -L/tmp/vader5-sdl-probe-lib \
+  -Wl,-rpath,/tmp/vader5-sdl-probe-lib \
+  -l:libSDL3.so.0 \
+  -o /tmp/sdl_rumble_probe
+
+/tmp/sdl_rumble_probe
+```
+
 ## Steam Input UI Quirks
 
 Assigning extra buttons through Steam Input's normal picker writes a clean
