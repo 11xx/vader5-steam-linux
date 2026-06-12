@@ -168,7 +168,7 @@ index 989609c..a3f39f9 100644
          Uint8 rumble_packet[] = { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, FLYDIGI_V2_HAPTIC_COMMAND, 6, 0, 0, 0, 0, 0 };
          rumble_packet[5] = low_frequency_rumble >> 8;
          rumble_packet[6] = high_frequency_rumble >> 8;
-@@ -640,14 +679,50 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
+@@ -640,14 +679,43 @@ static bool HIDAPI_DriverFlydigi_RumbleJoystick(SDL_HIDAPI_Device *device, SDL_J
      return true;
  }
  
@@ -176,18 +176,11 @@ index 989609c..a3f39f9 100644
 +{
 +    SDL_DriverFlydigi_Context *ctx = (SDL_DriverFlydigi_Context *)device->context;
 +    Uint8 rumble_packet[] = { FLYDIGI_V2_CMD_REPORT_ID, FLYDIGI_V2_MAGIC1, FLYDIGI_V2_MAGIC2, FLYDIGI_V2_HAPTIC_COMMAND, 6, 0, 0, 0, 0, 0 };
-+    Uint8 left_trigger = ctx->rumble_left_trigger;
-+    Uint8 right_trigger = ctx->rumble_right_trigger;
-+
-+    if (SDL_GetHintBoolean("SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE", true)) {
-+        left_trigger = SDL_max(left_trigger, ctx->rumble_left_grip);
-+        right_trigger = SDL_max(right_trigger, ctx->rumble_right_grip);
-+    }
 +
 +    rumble_packet[5] = ctx->rumble_left_grip;
 +    rumble_packet[6] = ctx->rumble_right_grip;
-+    rumble_packet[7] = left_trigger;
-+    rumble_packet[8] = right_trigger;
++    rumble_packet[7] = ctx->rumble_left_trigger;
++    rumble_packet[8] = ctx->rumble_right_trigger;
 +
 +    if (HIDAPI_DriverFlydigi_WritePacket(device, rumble_packet, sizeof(rumble_packet)) < 0) {
 +        return SDL_SetError("Couldn't send Vader 5 rumble packet");

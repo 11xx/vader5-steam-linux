@@ -332,8 +332,7 @@ _flydigi_patch_current() {
     local src="$1/src/joystick/hidapi/SDL_hidapi_flydigi.c"
     grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' "$src" 2>/dev/null \
         && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5' "$src" 2>/dev/null \
-        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null \
-        && grep -q 'SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE' "$src" 2>/dev/null
+        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null
 }
 
 _flydigi_patch_present() {
@@ -482,7 +481,7 @@ elif _flydigi_patch_current "$SDL_SRC"; then
     fi
 elif _flydigi_patch_present "$SDL_SRC"; then
     err "SDL source has an older Vader patch: $SDL_SRC"
-    err "Re-run with VADER5_REFRESH_SDL=1 to restore the two patched SDL files"
+    err "Re-run with VADER5_REFRESH_SDL=1 to restore the patched SDL files"
     err "from git and apply the current repo patch:"
     err "  VADER5_REFRESH_SDL=1 bash scripts/install.sh"
     exit 1
@@ -686,7 +685,6 @@ for _f in "$SDL32" "$SDL64"; do
 done
 
 export SDL_JOYSTICK_HIDAPI=1
-export SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE="${SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE:-1}"
 unset SDL_GAMECONTROLLERCONFIG
 
 ARGS=(

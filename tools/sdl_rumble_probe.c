@@ -1,6 +1,57 @@
 #include <SDL3/SDL.h>
 
+#include <inttypes.h>
 #include <stdio.h>
+
+static const char *gamepad_type_name(SDL_GamepadType type)
+{
+    switch (type) {
+    case SDL_GAMEPAD_TYPE_UNKNOWN:
+        return "unknown";
+    case SDL_GAMEPAD_TYPE_STANDARD:
+        return "standard";
+    case SDL_GAMEPAD_TYPE_XBOX360:
+        return "xbox360";
+    case SDL_GAMEPAD_TYPE_XBOXONE:
+        return "xboxone";
+    case SDL_GAMEPAD_TYPE_PS3:
+        return "ps3";
+    case SDL_GAMEPAD_TYPE_PS4:
+        return "ps4";
+    case SDL_GAMEPAD_TYPE_PS5:
+        return "ps5";
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+        return "switch-pro";
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+        return "switch-joycon-left";
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+        return "switch-joycon-right";
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+        return "switch-joycon-pair";
+    case SDL_GAMEPAD_TYPE_GAMECUBE:
+        return "gamecube";
+    case SDL_GAMEPAD_TYPE_STEAM:
+        return "steam";
+    default:
+        return "invalid";
+    }
+}
+
+static void print_gamepad_info(SDL_Gamepad *pad)
+{
+    SDL_PropertiesID props = SDL_GetGamepadProperties(pad);
+    char *mapping = SDL_GetGamepadMapping(pad);
+
+    printf("type=%s real_type=%s steam_handle=0x%016" PRIx64 "\n",
+           gamepad_type_name(SDL_GetGamepadType(pad)),
+           gamepad_type_name(SDL_GetRealGamepadType(pad)),
+           SDL_GetGamepadSteamHandle(pad));
+    printf("cap.rumble=%s cap.trigger_rumble=%s\n",
+           SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? "true" : "false",
+           SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_TRIGGER_RUMBLE_BOOLEAN, false) ? "true" : "false");
+    printf("mapping=%s\n", mapping ? mapping : "(none)");
+    SDL_free(mapping);
+}
 
 static void delay_with_events(Uint32 ms)
 {
@@ -89,9 +140,7 @@ int main(void)
         return 1;
     }
 
-    printf("mirror hint=%s\n",
-           SDL_GetHint("SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE") ?
-           SDL_GetHint("SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE") : "(default)");
+    print_gamepad_info(pad);
     printf("Report which motors move for each pulse.\n");
 
     pulse_normal(pad, 0xffff, 0x0000, "normal left");

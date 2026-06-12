@@ -265,16 +265,11 @@ The confirmed Vader 5 Pro rumble command payload is:
 ```
 
 Steam does not reliably send SDL's separate trigger-rumble call for games that
-only expose ordinary XInput-style rumble. To make those games use all four
-Vader motors, the patched SDL mirrors ordinary left/right rumble onto the
-left/right trigger motors by default. Native trigger rumble is still supported;
-when both paths are active, the driver sends the stronger value for each
-trigger. Set this before launching Steam to disable the compatibility mirror:
-
-```sh
-SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_MIRROR_RUMBLE=0 \
-  ~/.local/share/vader5-driver/wrapper.sh
-```
+only expose ordinary two-motor rumble. The patched SDL does not mirror ordinary
+rumble into the trigger motors: slots 0/1 are driven by `SDL_RumbleGamepad`,
+and slots 2/3 are driven only by `SDL_RumbleGamepadTriggers`. If grip rumble
+works but trigger rumble does not in Steam, the missing piece is Steam/Input
+choosing not to call SDL's trigger-rumble path for that device or game layer.
 
 `tools/sdl_rumble_probe.c` tests the deployed SDL path rather than raw hidraw:
 
