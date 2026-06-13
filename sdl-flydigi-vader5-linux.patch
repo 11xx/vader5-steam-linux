@@ -1,5 +1,5 @@
 diff --git a/src/joystick/hidapi/SDL_hidapi_flydigi.c b/src/joystick/hidapi/SDL_hidapi_flydigi.c
-index 989609c..1f07d86 100644
+index 989609c..04d12c9 100644
 --- a/src/joystick/hidapi/SDL_hidapi_flydigi.c
 +++ b/src/joystick/hidapi/SDL_hidapi_flydigi.c
 @@ -27,6 +27,17 @@
@@ -202,7 +202,7 @@ index 989609c..1f07d86 100644
 +        return false;
 +    }
 +
-+    (void)SDL_snprintf(link_path, sizeof(link_path), "/sys/class/input/%s/device", event_name);
++    (void)SDL_snprintf(link_path, sizeof(link_path), "/sys/class/input/%s/device/device", event_name);
 +    link_len = readlink(link_path, link_target, sizeof(link_target) - 1);
 +    if (link_len < 0) {
 +        return false;
