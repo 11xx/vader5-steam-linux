@@ -3,7 +3,7 @@
 #
 # Does not remove the SDL source/build tree under ~/sdl-build/SDL-main-vader5
 # and does not change the controller's onboard third-party firmware flag (use
-# tools/vader5-thirdparty.py disable if you want to revert that flag).
+# tools/vader5-thirdparty.py disable to revert that flag).
 
 set -euo pipefail
 
@@ -37,13 +37,13 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[1;33m'; NC='\033[0m'
 info() { echo -e "${BLUE}[info]${NC} $*"; }
 ok()   { echo -e "${GREEN}[ ok ]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 err()  { echo -e "${RED}[err ]${NC} $*" >&2; }
 
-if pgrep -f 'steamrt64/steam |ubuntu12_32/steam ' >/dev/null 2>&1; then
+if pgrep -f '(^|/)steamrt64/steam($| )|(^|/)ubuntu12_32/steam($| )' >/dev/null 2>&1; then
     err "Steam is currently running. Close Steam first (e.g. 'steam -shutdown') and re-run."
     exit 1
 fi
@@ -51,15 +51,7 @@ fi
 DEPLOY_DIR="$HOME/.local/share/vader5-driver"
 BACKUP_DIR="$DEPLOY_DIR/backups"
 RECEIPT_DIR="$DEPLOY_DIR/deployed"
-OVERRIDE="$HOME/.config/systemd/user/steam-launcher.service.d/override.conf"
-OVERRIDE_BACKUP="$OVERRIDE.vader5-backup"
-USER_DESKTOP="$HOME/.local/share/applications/steam.desktop"
-USER_DESKTOP_BACKUP="$USER_DESKTOP.vader5-backup"
 UDEV_RULE="/etc/udev/rules.d/60-vader5-sdl.rules"
-UNBIND_HELPER="/etc/vader5-driver/xpad-unbind.sh"
-UNBIND_SERVICE="/etc/systemd/system/vader5-xpad-unbind.service"
-OLD_PADCTL_RULE="/etc/udev/rules.d/60-padctl-vader5-userspace.rules"
-OLD_PADCTL_RULE_DISABLED="${OLD_PADCTL_RULE}.disabled"
 
 STEAM_ROOT=""
 for candidate in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
@@ -68,8 +60,6 @@ for candidate in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/r
         break
     fi
 done
-
-# ── 1. Restore backed-up stock Steam SDL3 files ───────────────────────────────
 
 _restore_file() {
     local rel_path="$1"
@@ -101,66 +91,15 @@ _restore_file() {
 _restore_file "steamrt64/libSDL3.so.0"
 _restore_file "steamrt64/libSDL3.so"
 
-# ── 2. Clean up any legacy launcher overrides ─────────────────────────────────
-
-if [[ -f "$OVERRIDE" ]] && grep -q "vader5-driver" "$OVERRIDE" 2>/dev/null; then
-    if [[ -f "$OVERRIDE_BACKUP" ]]; then
-        mv "$OVERRIDE_BACKUP" "$OVERRIDE"
-        ok "Restored previous systemd override"
-    else
-        rm -f "$OVERRIDE"
-        ok "Removed systemd override"
-    fi
-    systemctl --user daemon-reload 2>/dev/null || true
-elif [[ -f "$OVERRIDE_BACKUP" ]]; then
-    mv "$OVERRIDE_BACKUP" "$OVERRIDE"
-    systemctl --user daemon-reload 2>/dev/null || true
-    ok "Restored previous systemd override"
-fi
-
-if [[ -f "$USER_DESKTOP" ]] && grep -q "vader5-driver" "$USER_DESKTOP" 2>/dev/null; then
-    if [[ -f "$USER_DESKTOP_BACKUP" ]]; then
-        mv "$USER_DESKTOP_BACKUP" "$USER_DESKTOP"
-        ok "Restored previous .desktop override"
-    else
-        rm -f "$USER_DESKTOP"
-        ok "Removed .desktop override"
-    fi
-fi
-
-# ── 3. Udev rule and legacy root helpers ──────────────────────────────────────
-
 if [[ "$KEEP_UDEV" == "0" && -f "$UDEV_RULE" ]]; then
     sudo rm -f "$UDEV_RULE"
     sudo udevadm control --reload-rules
-    sudo udevadm trigger
+    sudo udevadm trigger --subsystem-match=hidraw
+    sudo udevadm settle
     ok "Removed udev rule"
 fi
 
-if [[ "$KEEP_UDEV" == "0" && -f "$OLD_PADCTL_RULE_DISABLED" && ! -f "$OLD_PADCTL_RULE" ]]; then
-    sudo mv "$OLD_PADCTL_RULE_DISABLED" "$OLD_PADCTL_RULE" \
-        && ok "Restored previous padctl udev rule"
-    sudo udevadm control --reload-rules
-fi
-
-if command -v systemctl >/dev/null 2>&1 && [[ -f "$UNBIND_SERVICE" ]]; then
-    sudo systemctl disable --now vader5-xpad-unbind.service 2>/dev/null || true
-    sudo rm -f "$UNBIND_SERVICE"
-    sudo systemctl daemon-reload
-    ok "Removed xpad unbind service"
-fi
-
-if [[ -f "$UNBIND_HELPER" ]]; then
-    sudo rm -f "$UNBIND_HELPER"
-    sudo rmdir /etc/vader5-driver 2>/dev/null || true
-    ok "Removed xpad unbind helper"
-fi
-
-# ── 4. Remove deployed state ──────────────────────────────────────────────────
-
 rm -rf "$DEPLOY_DIR/sdl" "$BACKUP_DIR" "$RECEIPT_DIR"
-rm -f "$DEPLOY_DIR/wrapper.sh" "$DEPLOY_DIR/steam-sdl-wrapper.sh" \
-      "$DEPLOY_DIR/sdl_intercept32.so" "$DEPLOY_DIR/sdl_intercept64.so"
 rmdir "$DEPLOY_DIR" 2>/dev/null || true
 ok "Removed $DEPLOY_DIR"
 

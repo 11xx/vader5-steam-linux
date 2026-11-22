@@ -9,7 +9,7 @@ The setup operates directly through Steam's native 64-bit `steamrt64` client and
 1. `xpad` stays bound to USB interface 0 (`:1.0`) for kernel Linux `FF_RUMBLE` force feedback.
 2. `/etc/udev/rules.d/60-vader5-sdl.rules` grants the active desktop user `uaccess` read/write access to the `37d7:2401` `/dev/hidraw*` vendor interface (`:1.1`).
 3. The controller's persistent firmware flag (`ThirdPartyEnabled=1`) allows third-party HIDAPI hosts (including SDL3) to acquire the controller via command `0x1C` (`owner="SDL"`).
-4. Upstream SDL3 `main` initializes the device (`0x07`, `0x01`, `0x10`, `0x1C`), decodes the 32-byte `5a a5 ef ...` extended reports (standard buttons, M1–M4, LM, RM, C, Z, Circle, triggers, sticks, gyro/accel, battery), and automatically hides the duplicate Linux `xpad` joystick via `HIDAPI_AddDeviceMatches` / `SDL_RemoveHiddenDevices`.
+4. Upstream SDL3 initializes the device (`0x07`, `0x01`, `0x10`, `0x1C`), decodes the 32-byte `5a a5 ef ...` extended reports (standard buttons, M1–M4, LM, RM, C, Z, Circle, triggers, sticks, gyro/accel, battery), and automatically hides the duplicate Linux `xpad` joystick via `HIDAPI_AddDeviceMatches` / `SDL_RemoveHiddenDevices`.
 5. [sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch) routes `SDL_RumbleGamepad` on Linux through the hidden `xpad` `/dev/input/event*` `FF_RUMBLE` endpoint (with fallback to `HIDAPI_DriverFlydigi_SendRumbleV2`) while leaving `SDL_RumbleGamepadTriggers` on upstream's four-motor Flydigi HID command (`0x12`).
 6. The library is built inside Valve's Steam Runtime 3 (`sniper`) SDK container (`registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest`), stripped, padded with trailing zero bytes to match Steam's manifest byte size, and installed directly into `~/.local/share/Steam/steamrt64/libSDL3.so.0` and `libSDL3.so`.
 
@@ -90,16 +90,16 @@ Expected entries:
 ls /sys/bus/usb/drivers/xpad/ | grep ':1.0'
 ```
 
-### 5. Standalone probe tools
+### 5. Standalone SDL3 probe tools
 
 Close Steam before running hardware probes to avoid concurrent HID reads/writes:
 
 ```sh
-# Test SDL3 gamepad enumeration, mapping, ordinary xpad rumble, and trigger rumble:
 rm -rf /tmp/vader5-sdl-probe-lib && mkdir -p /tmp/vader5-sdl-probe-lib
 ln -s "$HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0" \
   /tmp/vader5-sdl-probe-lib/libSDL3.so.0
 
+# Test SDL3 gamepad enumeration, mapping, ordinary xpad rumble, and trigger rumble:
 cc tools/sdl_rumble_probe.c \
   -I"$HOME/sdl-build/SDL-main-vader5/include" \
   -L/tmp/vader5-sdl-probe-lib \
@@ -108,18 +108,22 @@ cc tools/sdl_rumble_probe.c \
   -o /tmp/sdl_rumble_probe
 
 /tmp/sdl_rumble_probe
+
+# Test live SDL3 button and axis events:
+cc tools/sdl_event_probe.c \
+  -I"$HOME/sdl-build/SDL-main-vader5/include" \
+  -L/tmp/vader5-sdl-probe-lib \
+  -Wl,-rpath,/tmp/vader5-sdl-probe-lib \
+  -l:libSDL3.so.0 \
+  -o /tmp/sdl_event_probe
+
+/tmp/sdl_event_probe
 ```
-
-Additional probes under `tools/`:
-
-- `tools/sdl_event_probe.c` — prints live SDL3 button and axis events.
-- `tools/vader5_rumble_probe.c` — sweeps raw `5a a5 12 06 ...` payload slots directly over `/dev/hidrawN`.
-- `tools/vader5_raw_probe.c` — dumps raw 32-byte `hidraw` reports.
 
 ## Known Caveats
 
 - Flatpak Steam is not supported.
 - Steam Input's `Listen` binding helper can emit duplicate subcommands when binding extra buttons to stick clicks; assign those through the visual picker instead.
 - Steam's UI display label can briefly show a cached string even when `controller.txt` confirms the HIDAPI Flydigi mapping; trust `controller.txt`.
-- Steam client updates overwrite `steamrt64/libSDL3.so*` with new stock files; re-run `bash scripts/install.sh` afterwards to re-apply the patched library cleanly.
-- Observe-only companion daemons (such as `vader5-actions` reading `/dev/hidraw*` passively without writing commands) can run alongside Steam cleanly once `ThirdPartyEnabled=1` is active.
+- Steam client updates overwrite `steamrt64/libSDL3.so*` with new stock files; close Steam and re-run `bash scripts/install.sh` afterwards to re-apply the patched library cleanly.
+- Observe-only companion daemons reading `/dev/hidraw*` passively without sending conflicting commands can run alongside Steam once `ThirdPartyEnabled=1` is active.

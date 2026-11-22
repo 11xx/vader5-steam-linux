@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Build and deploy patched SDL3 for Flydigi Vader 5 Pro support in Steam on Linux.
 #
-# Builds upstream SDL3 inside the Steam Runtime 3 (Sniper) SDK container with the
-# local Linux xpad FF_RUMBLE patch, zero-pads the stripped shared library to match
-# Steam's manifest size, installs it directly into Steam's steamrt64 directory,
-# installs the udev hidraw access rule, and enables the controller's third-party
-# mapping firmware flag when connected.
+# Fetches the tested upstream SDL3 revision (or latest main with --update-sdl),
+# applies the Linux xpad FF_RUMBLE patch, builds 64-bit libSDL3.so.0 inside
+# Valve's Steam Runtime 3 (Sniper) SDK container, verifies ELF/ABI/symbol
+# coverage against Steam's steamrt64/ binaries, pads the binary with trailing
+# zero bytes to match Steam's manifest size, installs it directly into
+# steamrt64/, installs the hidraw udev ACL rule, and enables the controller's
+# persistent third-party mapping firmware flag when connected.
 
 set -euo pipefail
 
@@ -18,7 +20,10 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." &>/dev/null && pwd)"
 
-SDL_REF="${SDL_REF:-main}"
+# Pinned SDL3 revision verified against sdl-flydigi-vader5-linux.patch.
+# Override with SDL_REF=main or pass --update-sdl to track upstream main.
+DEFAULT_SDL_REF="c8da179691f909734cd1b124c930e49311428996"
+SDL_REF="${SDL_REF:-$DEFAULT_SDL_REF}"
 SDL_SRC="${SDL_SRC:-$HOME/sdl-build/SDL-main-vader5}"
 SDL_REPO_URL="https://github.com/libsdl-org/SDL.git"
 SNIPER_IMAGE="${SNIPER_IMAGE:-registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest}"
@@ -32,8 +37,9 @@ UDEV_RULE_DST="/etc/udev/rules.d/60-vader5-sdl.rules"
 PATCH_FILE="$REPO_ROOT/sdl-flydigi-vader5-linux.patch"
 THIRDPARTY_TOOL="$REPO_ROOT/tools/vader5-thirdparty.py"
 
-BUILD_MODE="auto"
+BUILD_MODE="sniper"
 FORCE_REBUILD=0
+UPDATE_SDL=0
 SKIP_UDEV=0
 SKIP_THIRDPARTY=0
 
@@ -42,9 +48,9 @@ usage() {
 Usage: scripts/install.sh [options]
 
 Options:
-  --sniper         Build inside SteamRT Sniper SDK container (podman/docker)
-  --native         Build natively on the host instead of inside Sniper SDK
+  --update-sdl     Fetch latest upstream SDL3 main and rebuild
   --rebuild        Force clean CMake configure and rebuild of SDL3
+  --native         Build natively on the host instead of inside Sniper SDK
   --skip-udev      Skip installing /etc/udev/rules.d/60-vader5-sdl.rules
   --no-thirdparty  Skip checking/enabling the Vader 5 Pro firmware flag
   -h, --help       Show this help
@@ -53,9 +59,10 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        --update-sdl)    UPDATE_SDL=1; SDL_REF="main"; FORCE_REBUILD=1 ;;
+        --rebuild)       FORCE_REBUILD=1 ;;
         --sniper)        BUILD_MODE="sniper" ;;
         --native)        BUILD_MODE="native" ;;
-        --rebuild)       FORCE_REBUILD=1 ;;
         --skip-udev)     SKIP_UDEV=1 ;;
         --no-thirdparty) SKIP_THIRDPARTY=1 ;;
         -h|--help)       usage; exit 0 ;;
@@ -84,7 +91,7 @@ done
 
 if [[ -z "$STEAM_ROOT" ]]; then
     err "Cannot find a native 64-bit Steam installation with steamrt64/ under \$HOME."
-    err "Ensure native Steam is installed and has completed its initial update."
+    err "Flatpak Steam is not supported; install native Steam and let it complete its initial update."
     exit 1
 fi
 
@@ -94,33 +101,14 @@ if [[ ! -f "$STEAM_SDL_PRIMARY" ]]; then
     exit 1
 fi
 
-if pgrep -f 'steamrt64/steam |ubuntu12_32/steam ' >/dev/null 2>&1; then
+if pgrep -f '(^|/)steamrt64/steam($| )|(^|/)ubuntu12_32/steam($| )' >/dev/null 2>&1; then
     err "Steam is currently running. Close Steam first (e.g. 'steam -shutdown') and re-run."
     exit 1
 fi
 
 ok "Steam root: $STEAM_ROOT"
 
-# ── 2. Select build backend (Sniper SDK container or native) ──────────────────
-
-CONTAINER_BIN=""
-if [[ "$BUILD_MODE" != "native" ]]; then
-    if command -v podman >/dev/null 2>&1; then
-        CONTAINER_BIN="podman"
-    elif command -v docker >/dev/null 2>&1; then
-        CONTAINER_BIN="docker"
-    elif [[ "$BUILD_MODE" == "sniper" ]]; then
-        err "--sniper requested, but neither podman nor docker was found."
-        exit 1
-    else
-        warn "Neither podman nor docker found; falling back to native host build"
-        BUILD_MODE="native"
-    fi
-fi
-
-if [[ "$BUILD_MODE" == "auto" ]]; then
-    BUILD_MODE="sniper"
-fi
+# ── 2. Check prerequisites and build backend ──────────────────────────────────
 
 check_host_tool() {
     if ! command -v "$1" >/dev/null 2>&1; then
@@ -136,31 +124,59 @@ check_host_tool readelf
 check_host_tool nm
 check_host_tool sha256sum
 
-if [[ "$BUILD_MODE" == "native" ]]; then
+CONTAINER_BIN=""
+if [[ "$BUILD_MODE" == "sniper" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+        CONTAINER_BIN="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        CONTAINER_BIN="docker"
+    else
+        err "Neither podman nor docker was found."
+        err "Install podman (recommended) to build against the exact Steam Runtime 3 Sniper ABI:"
+        err "  Arch / SteamOS / CachyOS: sudo pacman -S --needed podman"
+        err "  Fedora / Bazzite:         sudo dnf install -y podman"
+        err "  Ubuntu / Debian:          sudo apt-get install -y podman"
+        err "Or pass --native to build with host gcc/cmake/ninja and SDL3 dev headers."
+        exit 1
+    fi
+    info "Build mode: SteamRT Sniper SDK ($CONTAINER_BIN, $SNIPER_IMAGE)"
+else
     check_host_tool gcc
     check_host_tool cmake
     check_host_tool ninja
     check_host_tool strip
-    info "Build mode: native host toolchain"
-else
-    info "Build mode: SteamRT Sniper SDK ($CONTAINER_BIN, $SNIPER_IMAGE)"
+    warn "Build mode: native host toolchain (Sniper SDK via podman/docker is recommended for Steam ABI parity)"
 fi
 
 # ── 3. Prepare SDL3 source and apply patch ────────────────────────────────────
 
 info "SDL source: $SDL_SRC"
 
+_fetch_sdl_ref() {
+    info "Fetching SDL3 ($SDL_REF) into $SDL_SRC"
+    mkdir -p "$SDL_SRC"
+    if [[ ! -d "$SDL_SRC/.git" ]]; then
+        git init -q "$SDL_SRC"
+        git -C "$SDL_SRC" remote add origin "$SDL_REPO_URL"
+    fi
+    git -C "$SDL_SRC" fetch -q --depth 1 origin "$SDL_REF"
+    git -C "$SDL_SRC" checkout -q --detach FETCH_HEAD
+    ok "SDL3 checked out at $(git -C "$SDL_SRC" rev-parse --short HEAD)"
+}
+
 if [[ -d "$SDL_SRC/.git" ]]; then
-    info "SDL checkout present at $SDL_SRC"
+    if [[ "$UPDATE_SDL" == "1" ]]; then
+        git -C "$SDL_SRC" checkout -- src/joystick/hidapi/SDL_hidapi_flydigi.c 2>/dev/null || true
+        _fetch_sdl_ref
+    else
+        info "SDL checkout present at $SDL_SRC ($(git -C "$SDL_SRC" rev-parse --short HEAD))"
+    fi
 elif [[ -d "$SDL_SRC" && -n "$(find "$SDL_SRC" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     err "SDL source directory exists but is not a git checkout: $SDL_SRC"
     err "Move or remove it and re-run."
     exit 1
 else
-    info "Cloning SDL ($SDL_REF) into $SDL_SRC"
-    mkdir -p "$(dirname "$SDL_SRC")"
-    git clone --quiet --branch "$SDL_REF" --depth 1 "$SDL_REPO_URL" "$SDL_SRC"
-    ok "SDL cloned"
+    _fetch_sdl_ref
 fi
 
 PATCH_STAMP="$SDL_SRC/.vader5-patch.sha256"
@@ -175,26 +191,21 @@ _flydigi_patch_present() {
 _apply_patch() {
     info "Applying Vader 5 Linux xpad-rumble patch"
     if ! patch -N -p1 -d "$SDL_SRC" < "$PATCH_FILE"; then
-        err "Patch failed to apply against $SDL_SRC."
-        err "Check $PATCH_FILE against $SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c"
+        err "Patch failed to apply against $SDL_SRC ($(git -C "$SDL_SRC" rev-parse --short HEAD))."
+        err "Use the tested default revision (unset SDL_REF) or update $PATCH_FILE."
         exit 1
     fi
     PATCH_CHANGED=1
     ok "Patch applied"
 }
 
-if [[ "${VADER5_REFRESH_SDL:-0}" == "1" || "$FORCE_REBUILD" == "1" ]]; then
-    info "Resetting Flydigi driver sources from git before applying patch"
-    git -C "$SDL_SRC" checkout -- \
-        src/joystick/hidapi/SDL_hidapi_flydigi.c \
-        src/joystick/hidapi/SDL_hidapijoystick.c 2>/dev/null || true
+if [[ "$FORCE_REBUILD" == "1" ]]; then
+    git -C "$SDL_SRC" checkout -- src/joystick/hidapi/SDL_hidapi_flydigi.c 2>/dev/null || true
     _apply_patch
 elif _flydigi_patch_present "$SDL_SRC"; then
     if [[ "$PREVIOUS_PATCH_SHA" != "$PATCH_SHA" ]]; then
-        info "Patch file changed; resetting Flydigi driver sources and re-applying"
-        git -C "$SDL_SRC" checkout -- \
-            src/joystick/hidapi/SDL_hidapi_flydigi.c \
-            src/joystick/hidapi/SDL_hidapijoystick.c 2>/dev/null || true
+        info "Patch file changed; resetting Flydigi driver source and re-applying"
+        git -C "$SDL_SRC" checkout -- src/joystick/hidapi/SDL_hidapi_flydigi.c 2>/dev/null || true
         _apply_patch
     else
         ok "Vader 5 Linux xpad-rumble patch already applied"
@@ -430,71 +441,22 @@ PY
 _deploy_padded "steamrt64/libSDL3.so.0"
 _deploy_padded "steamrt64/libSDL3.so"
 
-# ── 8. Clean up legacy wrapper overrides if present ───────────────────────────
-
-USER_DESKTOP="$HOME/.local/share/applications/steam.desktop"
-if [[ -f "$USER_DESKTOP" ]] && grep -q 'vader5-driver' "$USER_DESKTOP" 2>/dev/null; then
-    if [[ -f "${USER_DESKTOP}.vader5-backup" ]]; then
-        mv "${USER_DESKTOP}.vader5-backup" "$USER_DESKTOP"
-        ok "Restored previous steam.desktop"
-    else
-        rm -f "$USER_DESKTOP"
-        ok "Removed legacy steam.desktop wrapper override"
-    fi
-fi
-
-SYSTEMD_OVERRIDE="$HOME/.config/systemd/user/steam-launcher.service.d/override.conf"
-if [[ -f "$SYSTEMD_OVERRIDE" ]] && grep -q 'vader5-driver' "$SYSTEMD_OVERRIDE" 2>/dev/null; then
-    if [[ -f "${SYSTEMD_OVERRIDE}.vader5-backup" ]]; then
-        mv "${SYSTEMD_OVERRIDE}.vader5-backup" "$SYSTEMD_OVERRIDE"
-        ok "Restored previous steam-launcher.service override"
-    else
-        rm -f "$SYSTEMD_OVERRIDE"
-        ok "Removed legacy steam-launcher.service wrapper override"
-    fi
-    systemctl --user daemon-reload 2>/dev/null || true
-fi
-
-rm -f "$DEPLOY_DIR/wrapper.sh" \
-      "$SDL_DEPLOY_DIR/sdl3_shim64.so" \
-      "$SDL_DEPLOY_DIR/sdl3_shim32.so" \
-      "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
-
-# ── 9. Udev rule (elevate only if missing or changed) ─────────────────────────
+# ── 8. Udev rule (elevate only if missing or changed) ─────────────────────────
 
 if [[ "$SKIP_UDEV" == "0" ]]; then
-    need_udev_reload=0
-    OLD_PADCTL_RULE="/etc/udev/rules.d/60-padctl-vader5-userspace.rules"
-    if [[ -f "$OLD_PADCTL_RULE" ]]; then
-        info "Disabling conflicting padctl udev rule"
-        sudo mv "$OLD_PADCTL_RULE" "${OLD_PADCTL_RULE}.disabled"
-        need_udev_reload=1
-    fi
-
     if [[ -f "$UDEV_RULE_DST" ]] && cmp -s "$UDEV_RULE_SRC" "$UDEV_RULE_DST"; then
         ok "Udev rule already up to date: $UDEV_RULE_DST"
     else
         info "Installing udev rule: $UDEV_RULE_DST"
         sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
-        need_udev_reload=1
-    fi
-
-    for legacy_root_file in /etc/systemd/system/vader5-xpad-unbind.service /etc/vader5-driver/xpad-unbind.sh; do
-        if [[ -f "$legacy_root_file" ]]; then
-            sudo systemctl disable --now vader5-xpad-unbind.service 2>/dev/null || true
-            sudo rm -f "$legacy_root_file"
-            sudo systemctl daemon-reload 2>/dev/null || true
-        fi
-    done
-
-    if [[ "$need_udev_reload" == "1" ]]; then
         sudo udevadm control --reload-rules
-        sudo udevadm trigger
-        ok "Udev rules reloaded"
+        sudo udevadm trigger --subsystem-match=hidraw
+        sudo udevadm settle
+        ok "Udev rule installed and applied"
     fi
 fi
 
-# ── 10. Enable Vader 5 Pro third-party mapping flag ───────────────────────────
+# ── 9. Enable Vader 5 Pro third-party mapping flag ────────────────────────────
 
 if [[ "$SKIP_THIRDPARTY" == "0" && -x "$THIRDPARTY_TOOL" ]]; then
     info "Checking Vader 5 Pro third-party mapping firmware flag"
@@ -524,5 +486,5 @@ echo "  Stock backup:        $BACKUP_DIR/steamrt64/libSDL3.so.0"
 echo "  Probe SDL3 copy:     $SDL_DEPLOY_DIR/libSDL3-64.so.0"
 echo "  Udev rule:           $UDEV_RULE_DST"
 echo ""
-echo "Launch Steam normally (no wrapper needed). Verify detection with:"
+echo "Launch Steam normally. Verify detection with:"
 echo "  grep -n 'Flydigi\\|Vader\\|HIDAPI' ~/.local/share/Steam/logs/controller.txt | tail -40"
