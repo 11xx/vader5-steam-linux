@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Install the SDL HIDAPI Vader 5 Pro override for Steam.
+# Build and deploy patched SDL3 for Flydigi Vader 5 Pro support in Steam on Linux.
+#
+# Builds upstream SDL3 inside the Steam Runtime 3 (Sniper) SDK container with the
+# local Linux xpad FF_RUMBLE patch, zero-pads the stripped shared library to match
+# Steam's manifest size, installs it directly into Steam's steamrt64 directory,
+# installs the udev hidraw access rule, and enables the controller's third-party
+# mapping firmware flag when connected.
 
 set -euo pipefail
 
 if [[ ${EUID:-$(id -u)} -eq 0 ]]; then
     echo "[err ] do NOT run this script with sudo." >&2
-    echo "       It installs into your \$HOME. Re-run as your own user." >&2
+    echo "       It installs into your \$HOME and elevates only for /etc udev rules." >&2
     exit 1
 fi
 
@@ -15,16 +21,48 @@ REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." &>/dev/null && pwd)"
 SDL_REF="${SDL_REF:-main}"
 SDL_SRC="${SDL_SRC:-$HOME/sdl-build/SDL-main-vader5}"
 SDL_REPO_URL="https://github.com/libsdl-org/SDL.git"
+SNIPER_IMAGE="${SNIPER_IMAGE:-registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest}"
 
 DEPLOY_DIR="$HOME/.local/share/vader5-driver"
 SDL_DEPLOY_DIR="$DEPLOY_DIR/sdl"
-WRAPPER_DST="$DEPLOY_DIR/wrapper.sh"
+BACKUP_DIR="$DEPLOY_DIR/backups"
+RECEIPT_DIR="$DEPLOY_DIR/deployed"
 UDEV_RULE_SRC="$REPO_ROOT/60-vader5-sdl.rules"
 UDEV_RULE_DST="/etc/udev/rules.d/60-vader5-sdl.rules"
-UNBIND_HELPER_DST="/etc/vader5-driver/xpad-unbind.sh"
-UNBIND_SERVICE_DST="/etc/systemd/system/vader5-xpad-unbind.service"
 PATCH_FILE="$REPO_ROOT/sdl-flydigi-vader5-linux.patch"
-PATCH_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
+THIRDPARTY_TOOL="$REPO_ROOT/tools/vader5-thirdparty.py"
+
+BUILD_MODE="auto"
+FORCE_REBUILD=0
+SKIP_UDEV=0
+SKIP_THIRDPARTY=0
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/install.sh [options]
+
+Options:
+  --sniper         Build inside SteamRT Sniper SDK container (podman/docker)
+  --native         Build natively on the host instead of inside Sniper SDK
+  --rebuild        Force clean CMake configure and rebuild of SDL3
+  --skip-udev      Skip installing /etc/udev/rules.d/60-vader5-sdl.rules
+  --no-thirdparty  Skip checking/enabling the Vader 5 Pro firmware flag
+  -h, --help       Show this help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --sniper)        BUILD_MODE="sniper" ;;
+        --native)        BUILD_MODE="native" ;;
+        --rebuild)       FORCE_REBUILD=1 ;;
+        --skip-udev)     SKIP_UDEV=1 ;;
+        --no-thirdparty) SKIP_THIRDPARTY=1 ;;
+        -h|--help)       usage; exit 0 ;;
+        *)               echo "[err ] Unknown option: $1" >&2; usage; exit 1 ;;
+    esac
+    shift
+done
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${BLUE}[info]${NC} $*"; }
@@ -32,436 +70,94 @@ ok()   { echo -e "${GREEN}[ ok ]${NC} $*"; }
 warn() { echo -e "${YELLOW}[warn]${NC} $*"; }
 err()  { echo -e "${RED}[err ]${NC} $*" >&2; }
 
-# ── Distro + package manager detection ───────────────────────────────────────
+PATCH_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
 
-PKG_MANAGER=""
-PKG_INSTALL=""
-PKG_CONFIG_32=""
-X11_32_LIB=""
-X11_INCLUDE=""
+# ── 1. Locate Steam and ensure it is not running ──────────────────────────────
 
-detect_env() {
-    if command -v pacman &>/dev/null; then
-        PKG_MANAGER=pacman
-        PKG_INSTALL="sudo pacman -S --needed --noconfirm"
-        PKG_CONFIG_32="/usr/lib32/pkgconfig"
-        X11_32_LIB="/usr/lib32/libX11.so"
-    elif command -v dnf &>/dev/null; then
-        PKG_MANAGER=dnf
-        PKG_INSTALL="sudo dnf install -y"
-        if [[ -d /usr/lib32/pkgconfig ]]; then
-            PKG_CONFIG_32="/usr/lib32/pkgconfig"
-            X11_32_LIB="/usr/lib32/libX11.so"
-        else
-            PKG_CONFIG_32="/usr/lib/pkgconfig"
-            X11_32_LIB="/usr/lib/libX11.so"
-        fi
-    elif command -v apt-get &>/dev/null; then
-        PKG_MANAGER=apt
-        PKG_INSTALL="sudo apt-get install -y"
-        PKG_CONFIG_32="/usr/lib/i386-linux-gnu/pkgconfig"
-        X11_32_LIB="/usr/lib/i386-linux-gnu/libX11.so"
-    elif command -v zypper &>/dev/null; then
-        PKG_MANAGER=zypper
-        PKG_INSTALL="sudo zypper install -y"
-        PKG_CONFIG_32="/usr/lib/pkgconfig"
-        X11_32_LIB="/usr/lib32/libX11.so"
-    else
-        warn "Unknown package manager — you may need to install build deps manually"
+STEAM_ROOT=""
+for candidate in "$HOME/.local/share/Steam" "$HOME/.steam/steam" "$HOME/.steam/root"; do
+    if [[ -d "$candidate/steamrt64" ]]; then
+        STEAM_ROOT="$(readlink -f "$candidate")"
+        break
     fi
+done
 
-    if [[ -d /usr/include/X11 ]]; then
-        X11_INCLUDE="/usr/include"
-    fi
-
-    if [[ -n "$X11_32_LIB" && ! -f "$X11_32_LIB" ]]; then
-        local found
-        found="$(ldconfig -p 2>/dev/null \
-            | awk '/libX11\.so.*ELF32|libX11\.so.*i386/{print $NF; exit}')"
-        [[ -n "$found" ]] && X11_32_LIB="$found"
-    fi
-
-    if [[ -n "$PKG_MANAGER" ]]; then
-        info "Detected package manager: $PKG_MANAGER"
-    fi
-}
-
-# ── Steam launcher detection ──────────────────────────────────────────────────
-
-STEAM_LAUNCHER=""
-
-detect_steam() {
-    for p in \
-        /usr/lib/steamos/steam-launcher \
-        /usr/bin/steam \
-        /usr/games/steam \
-        "$HOME/.local/share/Steam/steam.sh"; do
-        if [[ -x "$p" ]]; then
-            STEAM_LAUNCHER="$p"
-            ok "Steam launcher: $STEAM_LAUNCHER"
-            return
-        fi
-    done
-
-    if flatpak list 2>/dev/null | grep -q 'com.valvesoftware.Steam'; then
-        err "Flatpak Steam detected. This script does not support Flatpak Steam."
-        err "Install Steam as a native package or use the standalone installer."
-        exit 1
-    fi
-
-    err "Cannot find Steam. Install Steam and re-run."
+if [[ -z "$STEAM_ROOT" ]]; then
+    err "Cannot find a native 64-bit Steam installation with steamrt64/ under \$HOME."
+    err "Ensure native Steam is installed and has completed its initial update."
     exit 1
-}
-
-# ── Wiring mode detection ─────────────────────────────────────────────────────
-# service: override steam-launcher.service (SteamOS / Bazzite game mode)
-# desktop: override ~/.local/share/applications/steam.desktop (everywhere else)
-
-WIRE_MODE=""
-STEAM_DESKTOP_SRC=""
-
-detect_wiring_mode() {
-    if systemctl --user cat steam-launcher.service &>/dev/null; then
-        WIRE_MODE=service
-        info "Wiring mode: systemd service (steam-launcher.service)"
-        return
-    fi
-
-    for p in \
-        /usr/share/applications/steam.desktop \
-        /usr/lib/steam/steam.desktop \
-        /usr/local/share/applications/steam.desktop; do
-        if [[ -f "$p" ]]; then
-            STEAM_DESKTOP_SRC="$p"
-            WIRE_MODE=desktop
-            info "Wiring mode: .desktop override (source: $p)"
-            return
-        fi
-    done
-
-    if [[ -n "$STEAM_LAUNCHER" ]]; then
-        WIRE_MODE=desktop
-        warn "No system steam.desktop found; will create a minimal one"
-        return
-    fi
-
-    err "Cannot determine how to wire Steam. Report this at the project repo."
-    exit 1
-}
-
-# ── Prerequisites check ───────────────────────────────────────────────────────
-
-MISSING_TOOLS=()
-
-check_tool() {
-    command -v "$1" &>/dev/null || MISSING_TOOLS+=("$1")
-}
-
-install_deps() {
-    [[ ${#MISSING_TOOLS[@]} -eq 0 ]] && return
-
-    warn "Missing tools: ${MISSING_TOOLS[*]}"
-
-    if [[ -z "$PKG_MANAGER" ]]; then
-        err "Cannot auto-install — install the missing tools manually and re-run."
-        exit 1
-    fi
-
-    local pkgs=()
-    case "$PKG_MANAGER" in
-        pacman)
-            for t in "${MISSING_TOOLS[@]}"; do
-                case "$t" in
-                    cmake)    pkgs+=(cmake) ;;
-                    ninja)    pkgs+=(ninja) ;;
-                    git)      pkgs+=(git) ;;
-                    patch)    pkgs+=(patch) ;;
-                    gcc)      pkgs+=(gcc gcc-multilib) ;;
-                    bwrap)    pkgs+=(bubblewrap) ;;
-                    patchelf) pkgs+=(patchelf) ;;
-                esac
-            done
-            ;;
-        dnf)
-            for t in "${MISSING_TOOLS[@]}"; do
-                case "$t" in
-                    cmake)    pkgs+=(cmake) ;;
-                    ninja)    pkgs+=(ninja-build) ;;
-                    git)      pkgs+=(git) ;;
-                    patch)    pkgs+=(patch) ;;
-                    gcc)      pkgs+=(gcc glibc-devel.i686 libstdc++-devel.i686) ;;
-                    bwrap)    pkgs+=(bubblewrap) ;;
-                    patchelf) pkgs+=(patchelf) ;;
-                esac
-            done
-            ;;
-        apt)
-            for t in "${MISSING_TOOLS[@]}"; do
-                case "$t" in
-                    cmake)    pkgs+=(cmake) ;;
-                    ninja)    pkgs+=(ninja-build) ;;
-                    git)      pkgs+=(git) ;;
-                    patch)    pkgs+=(patch) ;;
-                    gcc)      pkgs+=(gcc gcc-multilib) ;;
-                    bwrap)    pkgs+=(bubblewrap) ;;
-                    patchelf) pkgs+=(patchelf) ;;
-                esac
-            done
-            ;;
-        zypper)
-            for t in "${MISSING_TOOLS[@]}"; do
-                case "$t" in
-                    cmake)    pkgs+=(cmake) ;;
-                    ninja)    pkgs+=(ninja) ;;
-                    git)      pkgs+=(git) ;;
-                    patch)    pkgs+=(patch) ;;
-                    gcc)      pkgs+=(gcc gcc-32bit) ;;
-                    bwrap)    pkgs+=(bubblewrap) ;;
-                    patchelf) pkgs+=(patchelf) ;;
-                esac
-            done
-            ;;
-    esac
-
-    if [[ ${#pkgs[@]} -gt 0 ]]; then
-        info "Installing: ${pkgs[*]}"
-        $PKG_INSTALL "${pkgs[@]}"
-    fi
-}
-
-install_x11_32() {
-    # Only needed for the 32-bit SDL cmake build
-    if [[ -n "$X11_32_LIB" && -f "$X11_32_LIB" ]]; then
-        return
-    fi
-
-    warn "32-bit libX11 not found at $X11_32_LIB"
-    [[ -z "$PKG_MANAGER" ]] && { err "Install 32-bit X11 dev libs manually and re-run."; exit 1; }
-
-    case "$PKG_MANAGER" in
-        pacman)  $PKG_INSTALL lib32-libx11 lib32-libxext lib32-glibc lib32-gcc-libs ;;
-        dnf)     # Fedora / Bazzite / Nobara — SDL's 32-bit cmake probe pulls
-                 # in the full X11 i686 dev surface, not just libX11/libXext.
-                 # Reported by RavioliAM (issue #2) on Nobara 43.
-                 $PKG_INSTALL \
-                     glibc-devel.i686 libstdc++-devel.i686 \
-                     libX11-devel.i686 libXext-devel.i686 \
-                     libXcursor-devel.i686 libXi-devel.i686 \
-                     libXfixes-devel.i686 libXrandr-devel.i686 \
-                     libXrender-devel.i686 libXinerama-devel.i686 \
-                     libXScrnSaver-devel.i686 libXtst-devel.i686 ;;
-        apt)     sudo dpkg --add-architecture i386 2>/dev/null || true
-                 sudo apt-get update -qq
-                 $PKG_INSTALL \
-                     libx11-dev:i386 libxext-dev:i386 \
-                     libxcursor-dev:i386 libxi-dev:i386 \
-                     libxfixes-dev:i386 libxrandr-dev:i386 \
-                     libxrender-dev:i386 libxinerama-dev:i386 \
-                     libxss-dev:i386 libxtst-dev:i386 ;;
-        zypper)  $PKG_INSTALL libX11-devel-32bit ;;
-    esac
-
-    # Re-probe after install
-    if [[ ! -f "$X11_32_LIB" ]]; then
-        local found
-        found="$(ldconfig -p 2>/dev/null \
-            | awk '/libX11\.so.*ELF32|libX11\.so.*i386/{print $NF; exit}')"
-        [[ -n "$found" ]] && X11_32_LIB="$found"
-    fi
-}
-
-# ── SDL cmake flags ───────────────────────────────────────────────────────────
-# Minimal Steam-client profile: video + X11 + OpenGL for the client UI,
-# HIDAPI + joystick for controller support, everything else off.
-# MinSizeRel + strip keeps the library well under Steam's original file sizes.
-# RUNPATH=$ORIGIN matches what Valve ships so Steam's module loader is happy.
-
-SDL_CMAKE_COMMON=(
-    -GNinja
-    -DCMAKE_BUILD_TYPE=MinSizeRel
-    -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
-    "-DCMAKE_INSTALL_RPATH=\$ORIGIN"
-    -DCMAKE_SKIP_BUILD_RPATH=OFF
-    -DBUILD_SHARED_LIBS=ON
-    -DSDL_SHARED=ON -DSDL_STATIC=OFF
-    -DSDL_TESTS=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_EXAMPLES=OFF
-    -DSDL_INSTALL_TESTS=OFF -DSDL_INSTALL_DOCS=OFF
-    -DSDL_AUDIO=OFF -DSDL_CAMERA=OFF -DSDL_DIALOG=OFF
-    -DSDL_GPU=OFF -DSDL_KMSDRM=OFF -DSDL_OFFSCREEN=OFF
-    -DSDL_OPENGLES=OFF -DSDL_PIPEWIRE=OFF -DSDL_PULSEAUDIO=OFF
-    -DSDL_SNDIO=OFF -DSDL_WAYLAND=OFF -DSDL_TRAY=OFF -DSDL_VULKAN=OFF
-    -DSDL_DBUS=OFF -DSDL_IBUS=OFF -DSDL_FRIBIDI=OFF -DSDL_LIBTHAI=OFF
-    -DSDL_JACK=OFF -DSDL_ALSA=OFF
-    -DSDL_HAPTIC=ON -DSDL_SENSOR=ON
-    -DSDL_HIDAPI=ON -DSDL_HIDAPI_JOYSTICK=ON -DSDL_HIDAPI_LIBUSB=ON
-    -DSDL_JOYSTICK=ON -DSDL_VIRTUAL_JOYSTICK=ON
-    -DSDL_VIDEO=ON -DSDL_RENDER=ON -DSDL_OPENGL=ON
-    -DSDL_X11=ON -DSDL_X11_SHARED=ON
-)
-
-# ── Build helpers ─────────────────────────────────────────────────────────────
-
-_verify_sdl() {
-    local lib="$1" bits="$2"
-    # shellcheck disable=SC2016 # Match literal RUNPATH=$ORIGIN.
-    if ! readelf -d "$lib" 2>/dev/null | grep -q 'RUNPATH.*\$ORIGIN'; then
-        warn "$lib is missing RUNPATH=\$ORIGIN — Steam's loader may not handle it correctly"
-    fi
-    local class
-    class="$(readelf -h "$lib" 2>/dev/null | awk '/Class:/{print $2}')"
-    if [[ "$bits" == "32" && "$class" != "ELF32" ]]; then
-        err "$lib is $class, expected ELF32"
-        exit 1
-    fi
-    if [[ "$bits" == "64" && "$class" != "ELF64" ]]; then
-        err "$lib is $class, expected ELF64"
-        exit 1
-    fi
-}
-
-_find_sdl_versioned() {
-    find "$1" -maxdepth 1 -name 'libSDL3.so.0.*' | head -1
-}
-
-PATCH_STAMP=""
-PATCH_CHANGED=0
-
-_flydigi_patch_current() {
-    local src="$1/src/joystick/hidapi/SDL_hidapi_flydigi.c"
-    grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' "$src" 2>/dev/null \
-        && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5' "$src" 2>/dev/null \
-        && grep -q 'HIDAPI_DriverFlydigi_RumbleVader5Xpad' "$src" 2>/dev/null \
-        && grep -q 'SDL_JOYSTICK_CAP_TRIGGER_RUMBLE' "$src" 2>/dev/null
-}
-
-_flydigi_patch_present() {
-    grep -q 'SDL_HIDAPI_Flydigi_SendVader5InitSequence' \
-        "$1/src/joystick/hidapi/SDL_hidapi_flydigi.c" 2>/dev/null
-}
-
-_apply_flydigi_patch() {
-    info "Applying Flydigi Linux patch"
-    if ! patch -N -p1 -d "$SDL_SRC" < "$PATCH_FILE"; then
-        err "Patch failed to apply. The SDL source may be at a different version."
-        err "Check $PATCH_FILE against $SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c"
-        exit 1
-    fi
-    PATCH_CHANGED=1
-    ok "Patch applied"
-}
-
-_refresh_flydigi_patch() {
-    info "Refreshing Flydigi Linux patch in $SDL_SRC"
-    git -C "$SDL_SRC" checkout -- \
-        src/joystick/hidapi/SDL_hidapi_flydigi.c \
-        src/joystick/hidapi/SDL_hidapijoystick.c
-    _apply_flydigi_patch
-}
-
-# ── Wiring functions ──────────────────────────────────────────────────────────
-
-wire_service() {
-    local override_dir="$HOME/.config/systemd/user/steam-launcher.service.d"
-    local override="$override_dir/override.conf"
-    local backup="$override.vader5-backup"
-    mkdir -p "$override_dir"
-
-    if [[ -f "$override" ]] \
-            && ! grep -q 'vader5-driver' "$override" 2>/dev/null \
-            && [[ ! -f "$backup" ]]; then
-        cp "$override" "$backup"
-        info "Backed up existing systemd override: $backup"
-    fi
-
-    cat > "$override" <<EOF
-[Service]
-ExecStart=
-ExecStart=$WRAPPER_DST
-EOF
-    systemctl --user daemon-reload
-    ok "Systemd override installed: $override"
-}
-
-wire_desktop() {
-    local dst="$HOME/.local/share/applications/steam.desktop"
-    local backup="$dst.vader5-backup"
-    mkdir -p "$(dirname "$dst")"
-
-    if [[ -f "$dst" ]] \
-            && ! grep -q 'vader5-driver' "$dst" 2>/dev/null \
-            && [[ ! -f "$backup" ]]; then
-        cp "$dst" "$backup"
-        info "Backed up existing .desktop override: $backup"
-    fi
-
-    if [[ -n "$STEAM_DESKTOP_SRC" ]]; then
-        awk -v wrapper="$WRAPPER_DST" '
-            /^\[/ { in_entry = ($0 == "[Desktop Entry]") }
-            in_entry && /^Exec=/ { print "Exec=" wrapper " %U"; next }
-            { print }
-        ' "$STEAM_DESKTOP_SRC" > "$dst"
-    else
-        cat > "$dst" <<EOF
-[Desktop Entry]
-Name=Steam
-Comment=Application for managing and playing games on Steam
-Exec=$WRAPPER_DST %U
-Icon=steam
-Terminal=false
-Type=Application
-Categories=Network;FileTransfer;Game;
-MimeType=x-scheme-handler/steam;x-scheme-handler/steamlink;
-StartupWMClass=Steam
-EOF
-    fi
-
-    ok ".desktop override installed: $dst"
-    info "The wrapper will be used when Steam is launched from your app menu."
-    info "To launch from terminal: $WRAPPER_DST"
-}
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-detect_env
-detect_steam
-detect_wiring_mode
-
-# ── 1. Prerequisites ──────────────────────────────────────────────────────────
-info "Checking prerequisites"
-
-check_tool gcc
-check_tool cmake
-check_tool ninja
-check_tool git
-check_tool bwrap
-check_tool patch
-check_tool patchelf
-
-install_deps
-
-if ! echo 'int main(){}' | gcc -m32 -x c - -o /dev/null 2>/dev/null; then
-    warn "gcc -m32 not working — 32-bit SDL build may fail"
-    case "${PKG_MANAGER:-}" in
-        pacman) warn "Try: sudo pacman -S --needed gcc-multilib lib32-glibc lib32-gcc-libs" ;;
-        dnf)    warn "Try: sudo dnf install -y glibc-devel.i686 libstdc++-devel.i686" ;;
-        apt)    warn "Try: sudo apt-get install -y gcc-multilib" ;;
-    esac
 fi
-ok "Prerequisites satisfied"
 
-# ── 2. SDL source ─────────────────────────────────────────────────────────────
+STEAM_SDL_PRIMARY="$STEAM_ROOT/steamrt64/libSDL3.so.0"
+if [[ ! -f "$STEAM_SDL_PRIMARY" ]]; then
+    err "Missing $STEAM_SDL_PRIMARY"
+    exit 1
+fi
+
+if pgrep -f 'steamrt64/steam |ubuntu12_32/steam ' >/dev/null 2>&1; then
+    err "Steam is currently running. Close Steam first (e.g. 'steam -shutdown') and re-run."
+    exit 1
+fi
+
+ok "Steam root: $STEAM_ROOT"
+
+# ── 2. Select build backend (Sniper SDK container or native) ──────────────────
+
+CONTAINER_BIN=""
+if [[ "$BUILD_MODE" != "native" ]]; then
+    if command -v podman >/dev/null 2>&1; then
+        CONTAINER_BIN="podman"
+    elif command -v docker >/dev/null 2>&1; then
+        CONTAINER_BIN="docker"
+    elif [[ "$BUILD_MODE" == "sniper" ]]; then
+        err "--sniper requested, but neither podman nor docker was found."
+        exit 1
+    else
+        warn "Neither podman nor docker found; falling back to native host build"
+        BUILD_MODE="native"
+    fi
+fi
+
+if [[ "$BUILD_MODE" == "auto" ]]; then
+    BUILD_MODE="sniper"
+fi
+
+check_host_tool() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        err "Missing required host tool: $1"
+        exit 1
+    fi
+}
+
+check_host_tool git
+check_host_tool patch
+check_host_tool python3
+check_host_tool readelf
+check_host_tool nm
+check_host_tool sha256sum
+
+if [[ "$BUILD_MODE" == "native" ]]; then
+    check_host_tool gcc
+    check_host_tool cmake
+    check_host_tool ninja
+    check_host_tool strip
+    info "Build mode: native host toolchain"
+else
+    info "Build mode: SteamRT Sniper SDK ($CONTAINER_BIN, $SNIPER_IMAGE)"
+fi
+
+# ── 3. Prepare SDL3 source and apply patch ────────────────────────────────────
+
 info "SDL source: $SDL_SRC"
 
 if [[ -d "$SDL_SRC/.git" ]]; then
-    info "SDL source already present at $SDL_SRC"
+    info "SDL checkout present at $SDL_SRC"
 elif [[ -d "$SDL_SRC" && -n "$(find "$SDL_SRC" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     err "SDL source directory exists but is not a git checkout: $SDL_SRC"
-    err "Move or remove it, then re-run:"
-    err "  mv \"$SDL_SRC\" \"${SDL_SRC}.bak\""
-    err "  # or: rm -rf \"$SDL_SRC\""
+    err "Move or remove it and re-run."
     exit 1
 else
-    info "Cloning SDL $SDL_REF into $SDL_SRC"
+    info "Cloning SDL ($SDL_REF) into $SDL_SRC"
     mkdir -p "$(dirname "$SDL_SRC")"
     git clone --quiet --branch "$SDL_REF" --depth 1 "$SDL_REPO_URL" "$SDL_SRC"
     ok "SDL cloned"
@@ -469,311 +165,364 @@ fi
 
 PATCH_STAMP="$SDL_SRC/.vader5-patch.sha256"
 PREVIOUS_PATCH_SHA="$(cat "$PATCH_STAMP" 2>/dev/null || true)"
+PATCH_CHANGED=0
 
-if [[ "${VADER5_REFRESH_SDL:-0}" == "1" ]]; then
-    _refresh_flydigi_patch
-elif _flydigi_patch_current "$SDL_SRC"; then
-    ok "Current Flydigi Linux patch already applied"
-    if [[ "$PREVIOUS_PATCH_SHA" != "$PATCH_SHA" ]]; then
-        PATCH_CHANGED=1
-        info "Patch stamp changed; SDL will be rebuilt"
+_flydigi_patch_present() {
+    grep -q 'HIDAPI_DriverFlydigi_RumbleVader5Xpad' \
+        "$1/src/joystick/hidapi/SDL_hidapi_flydigi.c" 2>/dev/null
+}
+
+_apply_patch() {
+    info "Applying Vader 5 Linux xpad-rumble patch"
+    if ! patch -N -p1 -d "$SDL_SRC" < "$PATCH_FILE"; then
+        err "Patch failed to apply against $SDL_SRC."
+        err "Check $PATCH_FILE against $SDL_SRC/src/joystick/hidapi/SDL_hidapi_flydigi.c"
+        exit 1
     fi
+    PATCH_CHANGED=1
+    ok "Patch applied"
+}
+
+if [[ "${VADER5_REFRESH_SDL:-0}" == "1" || "$FORCE_REBUILD" == "1" ]]; then
+    info "Resetting Flydigi driver sources from git before applying patch"
+    git -C "$SDL_SRC" checkout -- \
+        src/joystick/hidapi/SDL_hidapi_flydigi.c \
+        src/joystick/hidapi/SDL_hidapijoystick.c 2>/dev/null || true
+    _apply_patch
 elif _flydigi_patch_present "$SDL_SRC"; then
-    err "SDL source has an older Vader patch: $SDL_SRC"
-    err "Re-run with VADER5_REFRESH_SDL=1 to restore the patched SDL files"
-    err "from git and apply the current repo patch:"
-    err "  VADER5_REFRESH_SDL=1 bash scripts/install.sh"
+    if [[ "$PREVIOUS_PATCH_SHA" != "$PATCH_SHA" ]]; then
+        info "Patch file changed; resetting Flydigi driver sources and re-applying"
+        git -C "$SDL_SRC" checkout -- \
+            src/joystick/hidapi/SDL_hidapi_flydigi.c \
+            src/joystick/hidapi/SDL_hidapijoystick.c 2>/dev/null || true
+        _apply_patch
+    else
+        ok "Vader 5 Linux xpad-rumble patch already applied"
+    fi
+else
+    _apply_patch
+fi
+
+# ── 4. Determine target stock size before building ────────────────────────────
+
+STOCK_BACKUP_PRIMARY="$BACKUP_DIR/steamrt64/libSDL3.so.0"
+RECEIPT_PRIMARY="$RECEIPT_DIR/steamrt64/libSDL3.so.0.sha256"
+
+current_primary_sha="$(sha256sum "$STEAM_SDL_PRIMARY" | awk '{print $1}')"
+recorded_primary_sha="$(cat "$RECEIPT_PRIMARY" 2>/dev/null || true)"
+
+if [[ -n "$recorded_primary_sha" && "$current_primary_sha" == "$recorded_primary_sha" && -f "$STOCK_BACKUP_PRIMARY" ]]; then
+    TARGET_SIZE_64="$(stat -c '%s' "$STOCK_BACKUP_PRIMARY")"
+else
+    TARGET_SIZE_64="$(stat -c '%s' "$STEAM_SDL_PRIMARY")"
+fi
+
+info "Target steamrt64/libSDL3.so.0 size: $TARGET_SIZE_64 bytes"
+
+# ── 5. Build 64-bit SDL3 ──────────────────────────────────────────────────────
+
+SDL_BUILD64="$SDL_SRC/build-${BUILD_MODE}64"
+BUILT_LIB64="$SDL_BUILD64/libSDL3-stripped.so.0"
+
+_cmake_flags_array() {
+    local build_type="$1"
+    # shellcheck disable=SC2016 # Pass literal $ORIGIN to CMake/linker RUNPATH.
+    printf '%s\n' \
+        -GNinja \
+        "-DCMAKE_BUILD_TYPE=$build_type" \
+        -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+        '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+        -DCMAKE_SKIP_BUILD_RPATH=OFF \
+        -DBUILD_SHARED_LIBS=ON \
+        -DSDL_SHARED=ON -DSDL_STATIC=OFF \
+        -DSDL_TESTS=OFF -DSDL_TEST_LIBRARY=OFF -DSDL_EXAMPLES=OFF \
+        -DSDL_INSTALL_TESTS=OFF -DSDL_INSTALL_DOCS=OFF \
+        -DSDL_AUDIO=ON -DSDL_ALSA=ON -DSDL_ALSA_SHARED=ON \
+        -DSDL_PULSEAUDIO=ON -DSDL_PULSEAUDIO_SHARED=ON \
+        -DSDL_PIPEWIRE=ON -DSDL_PIPEWIRE_SHARED=ON \
+        -DSDL_JACK=OFF -DSDL_SNDIO=OFF \
+        -DSDL_VIDEO=ON -DSDL_RENDER=ON -DSDL_OPENGL=ON -DSDL_OPENGLES=ON -DSDL_VULKAN=ON \
+        -DSDL_X11=ON -DSDL_X11_SHARED=ON \
+        -DSDL_WAYLAND=OFF \
+        -DSDL_KMSDRM=OFF -DSDL_OFFSCREEN=ON \
+        -DSDL_DBUS=ON -DSDL_IBUS=OFF -DSDL_LIBUDEV=ON \
+        -DSDL_HIDAPI=ON -DSDL_HIDAPI_JOYSTICK=ON \
+        -DSDL_HIDAPI_LIBUSB=ON -DSDL_HIDAPI_LIBUSB_SHARED=ON \
+        -DSDL_JOYSTICK=ON -DSDL_VIRTUAL_JOYSTICK=ON \
+        -DSDL_HAPTIC=ON -DSDL_SENSOR=ON \
+        -DSDL_GPU=ON -DSDL_CAMERA=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF \
+        -DSDL_FRIBIDI=OFF -DSDL_LIBTHAI=OFF
+}
+
+_run_build64() {
+    local build_type="$1"
+    local log_file="/tmp/vader5-sdl-build64.log"
+    local -a cmake_flags
+    mapfile -t cmake_flags < <(_cmake_flags_array "$build_type")
+
+    if [[ "$BUILD_MODE" == "sniper" ]]; then
+        if ! "$CONTAINER_BIN" image exists "$SNIPER_IMAGE" >/dev/null 2>&1; then
+            info "Pulling $SNIPER_IMAGE (one-time ~1.3 GiB download)"
+            "$CONTAINER_BIN" pull "$SNIPER_IMAGE"
+        fi
+
+        local mount_opt="/src"
+        if [[ "$CONTAINER_BIN" == "podman" ]]; then
+            mount_opt="/src:Z"
+        fi
+
+        info "Building 64-bit SDL3 ($build_type) in Sniper SDK (log: $log_file)"
+        # shellcheck disable=SC2016 # Variables expand inside the container shell.
+        "$CONTAINER_BIN" run --rm \
+            -v "$SDL_SRC:$mount_opt" \
+            -w /src \
+            "$SNIPER_IMAGE" \
+            bash -ceu '
+                build_dir="$1"; shift
+                if [[ ! -f "$build_dir/build.ninja" ]]; then
+                    cmake -S /src -B "$build_dir" "$@"
+                fi
+                cmake --build "$build_dir" --target SDL3-shared -j"$(nproc)"
+                cp -L "$build_dir/libSDL3.so.0" "$build_dir/libSDL3-stripped.so.0"
+                strip --strip-unneeded "$build_dir/libSDL3-stripped.so.0"
+            ' _ "/src/build-${BUILD_MODE}64" "${cmake_flags[@]}" \
+            >"$log_file" 2>&1 \
+            || { err "Sniper SDK build failed — see $log_file"; exit 1; }
+    else
+        info "Building 64-bit SDL3 ($build_type) natively (log: $log_file)"
+        if [[ ! -f "$SDL_BUILD64/build.ninja" ]]; then
+            cmake -S "$SDL_SRC" -B "$SDL_BUILD64" "${cmake_flags[@]}" >"$log_file" 2>&1 \
+                || { err "Native cmake failed — see $log_file"; exit 1; }
+        fi
+        cmake --build "$SDL_BUILD64" --target SDL3-shared -j"$(nproc)" >>"$log_file" 2>&1 \
+            || { err "Native build failed — see $log_file"; exit 1; }
+        cp -L "$SDL_BUILD64/libSDL3.so.0" "$BUILT_LIB64"
+        strip --strip-unneeded "$BUILT_LIB64"
+    fi
+}
+
+if [[ "$FORCE_REBUILD" == "1" ]]; then
+    rm -rf "$SDL_BUILD64"
+fi
+
+if [[ -f "$BUILT_LIB64" && "$PATCH_CHANGED" != "1" && "$FORCE_REBUILD" != "1" ]]; then
+    ok "64-bit SDL3 build already up to date at $BUILT_LIB64"
+else
+    _run_build64 "Release"
+    built_size="$(stat -c '%s' "$BUILT_LIB64")"
+    if (( built_size > TARGET_SIZE_64 )); then
+        warn "Release build ($built_size bytes) exceeds target size ($TARGET_SIZE_64 bytes); rebuilding with MinSizeRel"
+        rm -rf "$SDL_BUILD64"
+        _run_build64 "MinSizeRel"
+    fi
+    ok "64-bit SDL3 built ($(stat -c '%s' "$BUILT_LIB64") bytes stripped)"
+fi
+
+# ── 6. Verify ELF metadata, size, and Steam symbol coverage ───────────────────
+
+info "Verifying built SDL3 binary"
+
+elf_class="$(LC_ALL=C readelf -h "$BUILT_LIB64" | awk '/Class:/{print $2}')"
+if [[ "$elf_class" != "ELF64" ]]; then
+    err "$BUILT_LIB64 is $elf_class, expected ELF64"
     exit 1
-else
-    _apply_flydigi_patch
 fi
 
-# ── 3. Build 64-bit SDL ───────────────────────────────────────────────────────
-SDL_BUILD64="$SDL_SRC/build-steam64"
-
-if [[ ! -f "$SDL_BUILD64/build.ninja" ]]; then
-    info "Configuring 64-bit SDL (build dir: $SDL_BUILD64)"
-    cmake -S "$SDL_SRC" -B "$SDL_BUILD64" \
-        "${SDL_CMAKE_COMMON[@]}" \
-        > /tmp/sdl-cmake64.log 2>&1 \
-        || { err "cmake 64-bit failed — see /tmp/sdl-cmake64.log"; exit 1; }
+# shellcheck disable=SC2016 # Match literal RUNPATH=$ORIGIN.
+if ! LC_ALL=C readelf -d "$BUILT_LIB64" | grep -q 'RUNPATH.*\$ORIGIN'; then
+    err "$BUILT_LIB64 is missing RUNPATH=\$ORIGIN"
+    exit 1
 fi
 
-if [[ -f "$SDL_BUILD64/libSDL3.so.0" && "$PATCH_CHANGED" != "1" ]]; then
-    ok "64-bit SDL build already present at $SDL_BUILD64"
-else
-    info "Building 64-bit SDL (this takes a few minutes)"
-    cmake --build "$SDL_BUILD64" --target SDL3-shared -j"$(nproc)" \
-        > /tmp/sdl-build64.log 2>&1 \
-        || { err "build 64-bit failed — see /tmp/sdl-build64.log"; exit 1; }
-    ok "64-bit SDL built"
+if ! LC_ALL=C readelf -d "$BUILT_LIB64" | grep -q 'SONAME.*\[libSDL3\.so\.0\]'; then
+    err "$BUILT_LIB64 is missing SONAME [libSDL3.so.0]"
+    exit 1
 fi
 
-# ── 4. Build 32-bit SDL ───────────────────────────────────────────────────────
-SDL_BUILD32="$SDL_SRC/build-steam32"
-
-install_x11_32
-
-if [[ ! -f "$SDL_BUILD32/build.ninja" ]]; then
-    info "Configuring 32-bit SDL (build dir: $SDL_BUILD32)"
-
-    CMAKE_32_EXTRA=(
-        "-DCMAKE_C_FLAGS=-m32"
-        "-DCMAKE_CXX_FLAGS=-m32"
-        "-DCMAKE_EXE_LINKER_FLAGS=-m32"
-        "-DCMAKE_SHARED_LINKER_FLAGS=-m32"
-    )
-
-    # X11 library hints for cross-compile to 32-bit
-    if [[ -n "$X11_32_LIB" && -f "$X11_32_LIB" ]]; then
-        CMAKE_32_EXTRA+=(
-            "-DX11_LIB=$X11_32_LIB"
-            "-DX11_X11_LIB=$X11_32_LIB"
-        )
-    fi
-    if [[ -n "$X11_INCLUDE" ]]; then
-        CMAKE_32_EXTRA+=("-DX11_INCLUDEDIR=$X11_INCLUDE")
-    fi
-
-    PKG_CONFIG_CMD=""
-    if [[ -n "$PKG_CONFIG_32" && -d "$PKG_CONFIG_32" ]]; then
-        PKG_CONFIG_CMD="PKG_CONFIG_LIBDIR=$PKG_CONFIG_32"
-    fi
-
-    env $PKG_CONFIG_CMD cmake -S "$SDL_SRC" -B "$SDL_BUILD32" \
-        "${SDL_CMAKE_COMMON[@]}" \
-        "${CMAKE_32_EXTRA[@]}" \
-        > /tmp/sdl-cmake32.log 2>&1 \
-        || { err "cmake 32-bit failed — see /tmp/sdl-cmake32.log"; exit 1; }
+built_size="$(stat -c '%s' "$BUILT_LIB64")"
+if (( built_size > TARGET_SIZE_64 )); then
+    err "Built SDL3 ($built_size bytes) exceeds Steam's stock size ($TARGET_SIZE_64 bytes); cannot zero-pad."
+    exit 1
 fi
 
-if [[ -f "$SDL_BUILD32/libSDL3.so.0" && "$PATCH_CHANGED" != "1" ]]; then
-    ok "32-bit SDL build already present at $SDL_BUILD32"
-else
-    info "Building 32-bit SDL (this takes a few minutes)"
-    cmake --build "$SDL_BUILD32" --target SDL3-shared -j"$(nproc)" \
-        > /tmp/sdl-build32.log 2>&1 \
-        || { err "build 32-bit failed — see /tmp/sdl-build32.log"; exit 1; }
-    ok "32-bit SDL built"
+tmp_need="$(mktemp)"
+tmp_have="$(mktemp)"
+trap 'rm -f "$tmp_need" "$tmp_have"' EXIT
+
+for bin in "$STEAM_ROOT/steamrt64"/*; do
+    [[ -f "$bin" ]] || continue
+    nm -D --undefined-only "$bin" 2>/dev/null | awk '{print $2}' | grep '^SDL_' || true
+done | sed 's/@@/@/g' | sort -u > "$tmp_need"
+
+nm -D --defined-only "$BUILT_LIB64" 2>/dev/null | awk '{print $3}' | grep '^SDL_' | sed 's/@@/@/g' | sort -u > "$tmp_have"
+
+missing_syms="$(comm -23 "$tmp_need" "$tmp_have")"
+if [[ -n "$missing_syms" ]]; then
+    err "Built SDL3 is missing symbols required by steamrt64/*:"
+    echo "$missing_syms" >&2
+    exit 1
 fi
 
-# Locate versioned .so files and verify them
-SDL64_VERSIONED="$(_find_sdl_versioned "$SDL_BUILD64")"
-SDL32_VERSIONED="$(_find_sdl_versioned "$SDL_BUILD32")"
-
-[[ -n "$SDL64_VERSIONED" ]] || { err "64-bit SDL .so not found in $SDL_BUILD64"; exit 1; }
-[[ -n "$SDL32_VERSIONED" ]] || { err "32-bit SDL .so not found in $SDL_BUILD32"; exit 1; }
-
-_verify_sdl "$SDL64_VERSIONED" 64
-_verify_sdl "$SDL32_VERSIONED" 32
+req_count="$(wc -l < "$tmp_need")"
+ok "Verified ELF64, SONAME, RUNPATH=\$ORIGIN, size ($built_size <= $TARGET_SIZE_64), and all $req_count required SDL_* symbols"
 printf '%s\n' "$PATCH_SHA" > "$PATCH_STAMP"
 
-# ── 5. Deploy patched SDL ─────────────────────────────────────────────────────
-info "Deploying patched SDL to $SDL_DEPLOY_DIR"
-mkdir -p "$SDL_DEPLOY_DIR"
+# ── 7. Back up stock Steam SDL3 and deploy size-padded binary ─────────────────
 
-install -m 755 "$SDL64_VERSIONED" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
-install -m 755 "$SDL32_VERSIONED" "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
+mkdir -p "$SDL_DEPLOY_DIR" "$BACKUP_DIR/steamrt64" "$RECEIPT_DIR/steamrt64"
 
-strip --strip-unneeded "$SDL_DEPLOY_DIR/libSDL3-64.so.0" 2>/dev/null || true
-strip --strip-unneeded "$SDL_DEPLOY_DIR/libSDL3-32.so.0" 2>/dev/null || true
+install -m 755 "$BUILT_LIB64" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
 
-ok "SDL deployed"
+_deploy_padded() {
+    local rel_path="$1"
+    local dst="$STEAM_ROOT/$rel_path"
+    local backup="$BACKUP_DIR/$rel_path"
+    local receipt="$RECEIPT_DIR/$rel_path.sha256"
 
-_has_trylock_symbol() {
-    readelf --dyn-syms --wide "$1" 2>/dev/null \
-        | awk '{print $8}' \
-        | grep -Eq '^SDL_TryLockJoysticks(@@|@|$)'
+    if [[ ! -f "$dst" || -L "$dst" ]]; then
+        return 0
+    fi
+
+    local cur_sha rec_sha target_size
+    cur_sha="$(sha256sum "$dst" | awk '{print $1}')"
+    rec_sha="$(cat "$receipt" 2>/dev/null || true)"
+
+    if [[ -n "$rec_sha" && "$cur_sha" == "$rec_sha" && -f "$backup" ]]; then
+        target_size="$(stat -c '%s' "$backup")"
+        info "Keeping existing stock backup for $rel_path ($target_size bytes)"
+    else
+        mkdir -p "$(dirname "$backup")"
+        cp -p "$dst" "$backup"
+        target_size="$(stat -c '%s' "$backup")"
+        ok "Backed up stock $rel_path ($target_size bytes)"
+    fi
+
+    if (( built_size > target_size )); then
+        err "Built SDL3 ($built_size bytes) exceeds $rel_path stock size ($target_size bytes)"
+        exit 1
+    fi
+
+    local tmp_dst="${dst}.vader5-tmp"
+    cp "$BUILT_LIB64" "$tmp_dst"
+    python3 - "$tmp_dst" "$target_size" <<'PY'
+import os, sys
+path, target = sys.argv[1], int(sys.argv[2])
+cur = os.path.getsize(path)
+if cur > target:
+    raise SystemExit(f"size {cur} exceeds target {target}")
+pad = target - cur
+if pad > 0:
+    with open(path, "ab") as f:
+        chunk = b"\x00" * 65536
+        while pad > 0:
+            n = min(pad, len(chunk))
+            f.write(chunk[:n])
+            pad -= n
+PY
+    chmod 755 "$tmp_dst"
+    mv -f "$tmp_dst" "$dst"
+
+    mkdir -p "$(dirname "$receipt")"
+    sha256sum "$dst" | awk '{print $1}' > "$receipt"
+    ok "Deployed $rel_path (padded to $target_size bytes, +$((target_size - built_size)) zero bytes)"
 }
 
-# ── 5b. SDL_TryLockJoysticks shim ─────────────────────────────────────────────
-# Some Steam clients require `SDL_TryLockJoysticks@@SDL3_0.0.0`, a symbol from
-# Valve's SDL fork. Current SDL main exports it; older upstream releases do not.
-if _has_trylock_symbol "$SDL_DEPLOY_DIR/libSDL3-64.so.0" \
-        && _has_trylock_symbol "$SDL_DEPLOY_DIR/libSDL3-32.so.0"; then
-    rm -f "$SDL_DEPLOY_DIR/sdl3_shim64.so" "$SDL_DEPLOY_DIR/sdl3_shim32.so"
-    ok "SDL_TryLockJoysticks is exported by SDL; shim not needed"
-else
-    info "Building SDL_TryLockJoysticks shim"
+_deploy_padded "steamrt64/libSDL3.so.0"
+_deploy_padded "steamrt64/libSDL3.so"
 
-    SHIM_BUILD="$(mktemp -d)"
-    trap 'rm -rf "$SHIM_BUILD"' EXIT
+# ── 8. Clean up legacy wrapper overrides if present ───────────────────────────
 
-    cat > "$SHIM_BUILD/sdl3_shim.c" <<'SHIM_C_EOF'
-/* Shim providing SDL_TryLockJoysticks for Steam clients built against
- * Valve's internal SDL fork. Older upstream SDL releases do not export this
- * symbol, so steamui.so can fail to load against an unmodified upstream SDL.
- *
- * Implementation: forward to SDL_LockJoysticks (always succeeds → return 1).
- */
-extern void SDL_LockJoysticks(void);
+USER_DESKTOP="$HOME/.local/share/applications/steam.desktop"
+if [[ -f "$USER_DESKTOP" ]] && grep -q 'vader5-driver' "$USER_DESKTOP" 2>/dev/null; then
+    if [[ -f "${USER_DESKTOP}.vader5-backup" ]]; then
+        mv "${USER_DESKTOP}.vader5-backup" "$USER_DESKTOP"
+        ok "Restored previous steam.desktop"
+    else
+        rm -f "$USER_DESKTOP"
+        ok "Removed legacy steam.desktop wrapper override"
+    fi
+fi
 
-int SDL_TryLockJoysticks(void)
-{
-    SDL_LockJoysticks();
-    return 1;
-}
-SHIM_C_EOF
+SYSTEMD_OVERRIDE="$HOME/.config/systemd/user/steam-launcher.service.d/override.conf"
+if [[ -f "$SYSTEMD_OVERRIDE" ]] && grep -q 'vader5-driver' "$SYSTEMD_OVERRIDE" 2>/dev/null; then
+    if [[ -f "${SYSTEMD_OVERRIDE}.vader5-backup" ]]; then
+        mv "${SYSTEMD_OVERRIDE}.vader5-backup" "$SYSTEMD_OVERRIDE"
+        ok "Restored previous steam-launcher.service override"
+    else
+        rm -f "$SYSTEMD_OVERRIDE"
+        ok "Removed legacy steam-launcher.service wrapper override"
+    fi
+    systemctl --user daemon-reload 2>/dev/null || true
+fi
 
-    cat > "$SHIM_BUILD/sdl3_shim.map" <<'SHIM_MAP_EOF'
-SDL3_0.0.0 {
-    global: SDL_TryLockJoysticks;
-    local: *;
-};
-SHIM_MAP_EOF
+rm -f "$DEPLOY_DIR/wrapper.sh" \
+      "$SDL_DEPLOY_DIR/sdl3_shim64.so" \
+      "$SDL_DEPLOY_DIR/sdl3_shim32.so" \
+      "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
 
-    _build_shim() {
-        local bits="$1" out="$2" sdl_lib="$3"
-        gcc -shared -fPIC -m"$bits" \
-            -Wl,--version-script="$SHIM_BUILD/sdl3_shim.map" \
-            -Wl,-soname,sdl3_shim.so \
-            -o "$out" "$SHIM_BUILD/sdl3_shim.c" \
-            -L"$SDL_DEPLOY_DIR" \
-            -Wl,-rpath,"$SDL_DEPLOY_DIR" \
-            -l:"$(basename "$sdl_lib")" \
-            || { err "$bits-bit shim build failed"; exit 1; }
-    }
+# ── 9. Udev rule (elevate only if missing or changed) ─────────────────────────
 
-    _build_shim 64 "$SDL_DEPLOY_DIR/sdl3_shim64.so" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
-    _build_shim 32 "$SDL_DEPLOY_DIR/sdl3_shim32.so" "$SDL_DEPLOY_DIR/libSDL3-32.so.0"
+if [[ "$SKIP_UDEV" == "0" ]]; then
+    need_udev_reload=0
+    OLD_PADCTL_RULE="/etc/udev/rules.d/60-padctl-vader5-userspace.rules"
+    if [[ -f "$OLD_PADCTL_RULE" ]]; then
+        info "Disabling conflicting padctl udev rule"
+        sudo mv "$OLD_PADCTL_RULE" "${OLD_PADCTL_RULE}.disabled"
+        need_udev_reload=1
+    fi
 
-    for _arch in 32 64; do
-        _lib="$SDL_DEPLOY_DIR/libSDL3-${_arch}.so.0"
-        if ! patchelf --print-needed "$_lib" 2>/dev/null | grep -qx 'sdl3_shim.so'; then
-            patchelf --add-needed sdl3_shim.so "$_lib" \
-                || { err "patchelf failed on $_lib"; exit 1; }
+    if [[ -f "$UDEV_RULE_DST" ]] && cmp -s "$UDEV_RULE_SRC" "$UDEV_RULE_DST"; then
+        ok "Udev rule already up to date: $UDEV_RULE_DST"
+    else
+        info "Installing udev rule: $UDEV_RULE_DST"
+        sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
+        need_udev_reload=1
+    fi
+
+    for legacy_root_file in /etc/systemd/system/vader5-xpad-unbind.service /etc/vader5-driver/xpad-unbind.sh; do
+        if [[ -f "$legacy_root_file" ]]; then
+            sudo systemctl disable --now vader5-xpad-unbind.service 2>/dev/null || true
+            sudo rm -f "$legacy_root_file"
+            sudo systemctl daemon-reload 2>/dev/null || true
         fi
     done
 
-    ok "SDL_TryLockJoysticks shim built and wired"
-fi
-
-# ── 6. Deploy bwrap wrapper ───────────────────────────────────────────────────
-info "Deploying bwrap wrapper"
-mkdir -p "$DEPLOY_DIR"
-
-cat > "$WRAPPER_DST" <<'WRAPPER_EOF'
-#!/bin/bash
-SDL32="$HOME/.local/share/vader5-driver/sdl/libSDL3-32.so.0"
-SDL64="$HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0"
-SHIM32="$HOME/.local/share/vader5-driver/sdl/sdl3_shim32.so"
-SHIM64="$HOME/.local/share/vader5-driver/sdl/sdl3_shim64.so"
-STEAM32="$HOME/.local/share/Steam/ubuntu12_32/libSDL3.so.0"
-STEAM64="$HOME/.local/share/Steam/ubuntu12_64/libSDL3.so.0"
-STEAM_SHIM32="$HOME/.local/share/Steam/ubuntu12_32/sdl3_shim.so"
-STEAM_SHIM64="$HOME/.local/share/Steam/ubuntu12_64/sdl3_shim.so"
-STEAM_LAUNCHER="@@STEAM_LAUNCHER@@"
-
-BWRAP="$(command -v bwrap 2>/dev/null)"
-if [[ -z "$BWRAP" ]]; then
-    echo "vader5-driver wrapper: bwrap not found — install bubblewrap" >&2
-    exit 1
-fi
-
-if [[ ! -x "$STEAM_LAUNCHER" ]]; then
-    echo "vader5-driver wrapper: missing Steam launcher: $STEAM_LAUNCHER" >&2
-    exit 1
-fi
-
-for _f in "$SDL32" "$SDL64"; do
-    if [[ ! -f "$_f" ]]; then
-        echo "vader5-driver wrapper: patched SDL not found: $_f" >&2
-        echo "  Re-run: bash scripts/install.sh" >&2
-        exit 1
+    if [[ "$need_udev_reload" == "1" ]]; then
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger
+        ok "Udev rules reloaded"
     fi
-done
-
-export SDL_JOYSTICK_HIDAPI=1
-export SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE="${SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE:-1}"
-unset SDL_GAMECONTROLLERCONFIG
-
-ARGS=(
-    --bind / / \
-    --dev-bind /dev /dev \
-    --proc /proc \
-    --bind "$SDL32" "$STEAM32" \
-    --bind "$SDL64" "$STEAM64"
-)
-
-if [[ -f "$SHIM32" && -f "$SHIM64" ]]; then
-    ARGS+=(
-        --bind "$SHIM32" "$STEAM_SHIM32"
-        --bind "$SHIM64" "$STEAM_SHIM64"
-    )
 fi
 
-exec "$BWRAP" "${ARGS[@]}" -- "$STEAM_LAUNCHER" -noverifyfiles -norepairfiles "$@"
-WRAPPER_EOF
+# ── 10. Enable Vader 5 Pro third-party mapping flag ───────────────────────────
 
-sed -i.bak "s|@@STEAM_LAUNCHER@@|$STEAM_LAUNCHER|g" "$WRAPPER_DST"
-rm -f "$WRAPPER_DST.bak"
-
-chmod 755 "$WRAPPER_DST"
-ok "Wrapper deployed: $WRAPPER_DST"
-
-# ── 7. Wire Steam ─────────────────────────────────────────────────────────────
-info "Wiring Steam (mode: $WIRE_MODE)"
-
-case "$WIRE_MODE" in
-    service) wire_service ;;
-    desktop) wire_desktop ;;
-esac
-
-# ── 8. Udev rule ──────────────────────────────────────────────────────────────
-info "Installing udev rule"
-
-OLD_PADCTL_RULE="/etc/udev/rules.d/60-padctl-vader5-userspace.rules"
-if [[ -f "$OLD_PADCTL_RULE" ]]; then
-    info "Disabling old padctl udev rule"
-    sudo mv "$OLD_PADCTL_RULE" "${OLD_PADCTL_RULE}.disabled" \
-        || warn "Could not disable old padctl rule — remove it manually if present"
-fi
-
-sudo install -m 644 "$UDEV_RULE_SRC" "$UDEV_RULE_DST"
-sudo udevadm control --reload-rules
-sudo udevadm trigger
-ok "Udev rule installed"
-
-# ── 9. Legacy xpad unbind cleanup ─────────────────────────────────────────────
-info "Removing legacy xpad unbind helper"
-
-if command -v systemctl &>/dev/null; then
-    sudo systemctl disable --now vader5-xpad-unbind.service 2>/dev/null || true
-    sudo rm -f "$UNBIND_SERVICE_DST"
-    sudo systemctl daemon-reload
-fi
-sudo rm -f "$UNBIND_HELPER_DST"
-ok "xpad left bound for Vader 5 haptics backend"
-
-# ── 10. Restart Steam ─────────────────────────────────────────────────────────
-if [[ "$WIRE_MODE" == "service" ]] \
-        && systemctl --user is-active steam-launcher.service &>/dev/null; then
-    info "Restarting steam-launcher.service"
-    systemctl --user restart steam-launcher.service
-    ok "Steam restarted"
-elif [[ "$WIRE_MODE" == "service" ]]; then
-    warn "steam-launcher.service is not running — start Steam to apply the override"
-else
-    warn "Close and reopen Steam from your app menu for the .desktop override to take effect"
+if [[ "$SKIP_THIRDPARTY" == "0" && -x "$THIRDPARTY_TOOL" ]]; then
+    info "Checking Vader 5 Pro third-party mapping firmware flag"
+    set +e
+    tp_out="$("$THIRDPARTY_TOOL" enable 2>&1)"
+    tp_rc=$?
+    set -e
+    if [[ "$tp_rc" -eq 0 ]]; then
+        printf '  %s\n' "${tp_out//$'\n'/$'\n'  }"
+        ok "Controller third-party mapping flag is enabled"
+    elif [[ "$tp_rc" -eq 2 ]]; then
+        warn "Controller not connected or asleep; wake it and run:"
+        warn "  $THIRDPARTY_TOOL enable"
+    else
+        warn "Could not update controller third-party flag:"
+        printf '  %s\n' "${tp_out//$'\n'/$'\n'  }" >&2
+    fi
 fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
+
 echo ""
 ok "Installation complete."
 echo ""
-echo "  Patched SDL:  $SDL_DEPLOY_DIR/"
-echo "  Wrapper:      $WRAPPER_DST"
-echo "  Udev rule:    $UDEV_RULE_DST"
-case "$WIRE_MODE" in
-    service) echo "  Systemd:      $HOME/.config/systemd/user/steam-launcher.service.d/override.conf" ;;
-    desktop) echo "  Desktop:      $HOME/.local/share/applications/steam.desktop" ;;
-esac
+echo "  Patched Steam SDL3:  $STEAM_ROOT/steamrt64/libSDL3.so.0"
+echo "  Stock backup:        $BACKUP_DIR/steamrt64/libSDL3.so.0"
+echo "  Probe SDL3 copy:     $SDL_DEPLOY_DIR/libSDL3-64.so.0"
+echo "  Udev rule:           $UDEV_RULE_DST"
 echo ""
-echo "Next steps:"
-echo "  1. Start Steam through the installed launcher/wrapper."
-echo "  2. In Steam: Settings → Controller → Detected Controllers."
-echo "     The device should now appear as 'Flydigi Vader 5 Pro' (or similar)"
-echo "     rather than 'Generic X-Box pad'."
-echo "  3. If it still shows as Xbox, check the logs:"
-echo "     journalctl --user -u steam-launcher.service -n 50  (service mode)"
-echo "     grep -n 'Flydigi\|Vader\|HIDAPI' ~/.local/share/Steam/logs/controller.txt"
+echo "Launch Steam normally (no wrapper needed). Verify detection with:"
+echo "  grep -n 'Flydigi\\|Vader\\|HIDAPI' ~/.local/share/Steam/logs/controller.txt | tail -40"

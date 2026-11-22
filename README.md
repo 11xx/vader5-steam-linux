@@ -1,234 +1,108 @@
-# Flydigi Vader 5 Pro — native SDL HIDAPI on Linux
+# Flydigi Vader 5 Pro — native SDL3 HIDAPI on Linux
 
-Makes Steam detect the Vader 5 Pro natively via SDL's Flydigi HIDAPI driver, giving full access to M1–M4, LM, RM, C, Z, and the rest of the extended button surface without a userspace daemon or virtual controller.
+Enables native Flydigi Vader 5 Pro (`37d7:2401`) support in Steam on Linux with full Steam Input access to M1–M4, LM, RM, C, Z, Circle, gyro, and Xbox-compatible ordinary rumble plus trigger rumble—without Windows, Flydigi Space Station, virtual controllers, or launcher wrappers.
 
 ## Install
+
+Close Steam first, wake or plug in the controller, and run:
 
 ```sh
 bash scripts/install.sh
 ```
 
-Clones SDL3, applies the patch, builds 32+64-bit SDL, deploys everything, and wires Steam to use it. It also installs the udev access rule and removes the legacy xpad-unbind helper. In Steam → Settings → Controller → Detected Controllers the device should appear as **Flydigi Vader 5 Pro** with the full button set visible in Steam Input.
+The installer:
 
-For the debugging notes, confirmed behavior, and protocol findings behind this fix, see [FIX.md](FIX.md).
+1. Clones or updates upstream SDL3 (`main`) and applies the local Linux `xpad` `FF_RUMBLE` patch ([sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch)).
+2. Builds 64-bit `libSDL3.so.0` inside Valve's Steam Runtime 3 (`sniper`) SDK container via `podman` or `docker` (with `--native` available as a host-toolchain option).
+3. Verifies ELF metadata, ABI (`SONAME`, `RUNPATH=$ORIGIN`), size headroom, and full symbol coverage against Steam's `steamrt64/` binaries.
+4. Backs up Steam's stock `steamrt64/libSDL3.so.0` and `steamrt64/libSDL3.so`, then installs the patched library padded with trailing zero bytes to match Steam's manifest file size.
+5. Installs `/etc/udev/rules.d/60-vader5-sdl.rules` for user-level `/dev/hidraw*` access.
+6. Enables the controller's persistent third-party mapping firmware flag (`0x11` command) via [tools/vader5-thirdparty.py](tools/vader5-thirdparty.py).
 
-To uninstall: `bash scripts/uninstall.sh`
+Start Steam normally afterwards. In **Steam → Settings → Controller → Detected Controllers**, the controller appears as **Flydigi Vader 5 Pro** with the full extended button surface visible in Steam Input.
 
-## Compatibility
+For protocol details, validation commands, and rumble notes, see [FIX.md](FIX.md).
 
-Works on SteamOS / Steam Deck, Bazzite, Arch, CachyOS, Fedora, Ubuntu, Debian, and any distro running native Steam. The install script detects your environment and adapts:
+To restore Steam's stock SDL3 libraries and remove installed files:
 
-| Environment | Steam wiring |
-|---|---|
-| SteamOS / Steam Deck (game mode), Bazzite | `steam-launcher.service.d` ExecStart override |
-| Desktop installs (Arch, Fedora, Ubuntu, etc.) | `~/.local/share/applications/steam.desktop` override |
+```sh
+bash scripts/uninstall.sh
+```
 
-Package manager (pacman / dnf / apt / zypper) and 32-bit library paths are detected automatically. Missing build tools are offered for auto-install.
+## Firmware third-party mapping switch
 
-Flatpak Steam is not supported — install Steam as a native package or via the [Steam installer](https://store.steampowered.com/about/).
+Vader 5 Pro firmware (`7.1.x`, `>= 0x7141`) gates its Flydigi HIDAPI acquire handshake (`0x1C`) behind a persistent onboard flag (`ThirdPartyEnabled`, byte 9 of the `0x10` status response). When that flag is `0`, SDL3 leaves the HIDAPI device unavailable and Steam falls back to the generic Xbox controller on interface 0.
+
+`tools/vader5-thirdparty.py` inspects and toggles that flag directly over Linux `hidraw`:
+
+```sh
+./tools/vader5-thirdparty.py status
+./tools/vader5-thirdparty.py enable
+./tools/vader5-thirdparty.py disable
+```
+
+The flag persists in the controller's onboard flash across power cycles and reconnects. The `enable`/`disable` write checks that the controller is running validated `7.1.x` firmware (`0x7141`–`0x71ff`) before sending the `0x11` command.
 
 ## How it works
 
-### The problem
+### USB interface layout
 
 The Vader 5 Pro exposes two USB interfaces:
 
-| Interface | Driver | Protocol |
+| Interface | Driver | Role |
 |---|---|---|
-| 0 (XInput) | `xpad` kernel module | Standard Xbox input plus Linux `FF_RUMBLE` haptics |
-| 1 (DInput / Flydigi) | SDL HIDAPI | Vendor-specific 32-byte report, unnumbered, magic `5a a5 ef …` |
+| 0 (XInput) | `xpad` kernel module | Standard Xbox input and Linux `FF_RUMBLE` force feedback |
+| 1 (Flydigi HID) | SDL3 HIDAPI (`SDL_HIDAPI_DriverFlydigi`) | 32-byte unnumbered reports (`5a a5 ef ...`) carrying M1–M4, LM, RM, C, Z, Circle, IMU, battery, and 4-motor rumble |
 
-The extra inputs — M1–M4, LM, RM, C, Z, gyro, and raw four-slot Flydigi rumble — live on interface 1. Interface 0 does not expose those inputs, but its xpad force-feedback path matches the controller's Xbox-compatible ordinary rumble behavior.
+Upstream SDL3 `main` handles the Vader 5 Pro HIDAPI protocol, button/axis/IMU decoding, four-motor HID rumble (`0x12`), hotplug reacquire, and automatic hiding of the duplicate Linux `xpad` joystick once the controller's third-party flag is enabled.
 
-SDL3's Flydigi HIDAPI driver was written for earlier controllers (Vader 2 Pro, Vader 3 Pro) and did not fully bring the Vader 5 Pro's interface 1 into its extended streaming mode on Linux. Without the fix, SDL either fails to parse the vendor reports or Steam falls back to interface 0 via `xpad`, so Steam sees a generic Xbox pad and the extra surface is not reliably remappable.
+### Why the local SDL patch exists
 
-The upstream fix is not in the SDL build Steam currently ships on Linux. This repo builds SDL `main`, applies the local Vader 5 Pro Linux patch, and overlays that SDL only for the Steam client.
+Games that drive ordinary two-motor Xbox rumble (`SDL_RumbleGamepad`) rely on the controller firmware's Xbox-compatible rumble path on interface 0 (`xpad`) to produce trigger participation alongside grip vibration. Sending two-motor rumble exclusively over the raw Flydigi HID command (`5a a5 12 ...`) only drives the grip motors unless the caller explicitly invokes `SDL_RumbleGamepadTriggers`.
 
-### Why you can't just replace Steam's SDL file
+[sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch) keeps `xpad` bound to interface 0, lets upstream SDL3 hide the duplicate `xpad` joystick from applications, and routes ordinary `SDL_RumbleGamepad` calls for `37d7:2401` through that hidden `/dev/input/event*` `FF_RUMBLE` node (matched via `/sys/class/input/eventN/device/device` → `:1.0`). If the `xpad` event node is unavailable—or if `SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE=0` is set—it falls back to upstream `HIDAPI_DriverFlydigi_SendRumbleV2`. Direct trigger-rumble calls (`SDL_RumbleGamepadTriggers`) always use upstream's 4-motor Flydigi HID path.
 
-Steam runs a hash-based file verifier (`BVerifyInstalledFiles`) that detects any change to its bundled libraries and restores the originals within minutes. Three other approaches also fail:
+### Direct Steam deployment and Sniper SDK ABI
 
-- **LD_PRELOAD dlopen interceptor** — only catches explicit `dlopen()` calls. `steamui.so` declares SDL as a `NEEDED` compile-time dependency, so the dynamic linker resolves it at load time before any injected code runs. The hook is never called.
-- **LD_LIBRARY_PATH prepend** — would work in principle (`steamui.so` uses `RUNPATH`, not `RPATH`, so `LD_LIBRARY_PATH` takes priority). But Steam's startup script unconditionally overwrites `LD_LIBRARY_PATH` with its own runtime directories before `steamui.so` loads, clobbering any value we set.
-- **`unshare --user --mount --map-root-user`** — creates a private namespace where bind mounts work, but maps the process to uid=0 inside. Steam's bootstrap explicitly checks `id -u` and exits with "Cannot run as root user".
+The Linux Steam client runs natively as 64-bit `steamrt64/steam` inside Steam Runtime 3 (`steamrt3c` Pressure Vessel) and links `steamrt64/libSDL3.so.0` via `DT_NEEDED` with `RUNPATH=$ORIGIN`.
 
-### The solution: bubblewrap
+- Building inside `registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest` targets the exact Steam Runtime 3 glibc ABI (`<= GLIBC_2.31`) with the same dynamically loaded SDL3 feature set Valve ships (`*_SHARED=ON` for X11, PipeWire, PulseAudio, ALSA, DBus, libusb, Vulkan, OpenGL, and GPU, with `SDL_WAYLAND=OFF` so `steamwebhelper` always receives an X11/XWayland window handle) while keeping `DT_NEEDED` minimal (`libc`, `libm`, `libdl`, `libpthread`).
+- Steam's startup bootstrapper checks manifest file sizes (`Verifying file sizes only`) on normal launches. Padding the stripped `libSDL3.so.0` with trailing zero bytes to match the stock library's exact byte size lets Steam launch directly without wrappers or repair loops; the ELF loader ignores trailing bytes past the loadable segments.
+- When Steam ships a client update, Steam replaces `steamrt64/libSDL3.so*` cleanly with its new stock copy. Re-running `bash scripts/install.sh` records the new stock backup and re-applies the patched library for the updated size.
 
-`bwrap` is a setuid-root namespace helper already installed on SteamOS (for Pressure Vessel) and available as a standard package everywhere else. It creates a private mount namespace while preserving the real uid — so uid=1000 stays uid=1000 inside the namespace and Steam starts normally.
+## Prerequisites
 
-The deployed `wrapper.sh` does:
-
-```bash
-exec bwrap \
-    --bind / /                     \  # mirror the host tree
-    --dev-bind /dev /dev           \  # device access (hidraw, input, DRI…)
-    --proc /proc                   \  # /proc for Steam's self-inspection
-    --bind "$SDL32" "$STEAM32"     \  # patched 32-bit SDL over Steam's copy
-    --bind "$SDL64" "$STEAM64"     \  # patched 64-bit SDL over Steam's copy
-    -- "$STEAM_LAUNCHER" -noverifyfiles -norepairfiles "$@"
-```
-
-Inside the namespace, Steam's SDL paths resolve to our patched build. `steamui.so`'s `NEEDED: libSDL3.so.0` is satisfied by our SDL via `RUNPATH=$ORIGIN`. The host filesystem is never touched, and the wrapper passes Steam's `-noverifyfiles -norepairfiles` flags so the bootstrapper does not try to repair the bind-mounted SDL paths.
-
-### What the patch changes
-
-`sdl-flydigi-vader5-linux.patch` updates SDL's Flydigi HIDAPI path for the Vader 5 Pro:
-
-- **Interface-1 driver selection** — forces the Vader 5 Pro's Flydigi interface to use SDL's Flydigi HIDAPI driver instead of losing to the generic path.
-- **Raw 32-byte writes** — sends Vader 5 Pro commands as unnumbered 32-byte reports on interface 1.
-- **padctl-derived init/test mode** — sends the same init sequence and `5a a5 11 07 ... 15 00` enable command that padctl uses to make the controller stream `5a a5 ef ...` extended reports.
-- **Less brittle status handling** — keeps the HIDAPI device available after init instead of hiding it when the controller does not answer the older acquire flow.
-- **xpad haptics backend** — hides the Vader's duplicate xpad input device from SDL/Steam while privately using that same Linux `FF_RUMBLE` device for ordinary rumble. SDL trigger-rumble calls still use the raw Flydigi trigger slots.
-
-The existing SDL button mapping is then used for M1-M4, LM, RM, C, Z, and the other extended buttons.
-
-### The `SDL_TryLockJoysticks` shim
-
-Some Steam client builds are built against Valve's internal SDL fork and require `SDL_TryLockJoysticks@@SDL3_0.0.0`. Current SDL `main` exports this symbol, so no shim is needed in the normal install path.
-
-If you override `SDL_REF`/`SDL_SRC` to build an older SDL tree that lacks the symbol, the installer builds a tiny optional shim (`sdl3_shim{32,64}.so`) and bind-mounts it next to the patched SDL inside the wrapper namespace. No host Steam file ever changes.
-
-This repo is licensed under MIT. The included patch targets SDL, which is licensed upstream under zlib. If you redistribute patched SDL builds, preserve SDL's upstream notices as required by that project.
-
-### xpad haptics backend
-
-The old version of this fix unbound `xpad` from interface 0 to avoid a duplicate generic Xbox controller. That made the full Flydigi button surface work, but it also removed the kernel force-feedback path that the controller firmware uses for its Xbox-compatible rumble behavior.
-
-The current patch leaves `xpad` bound, teaches SDL's HIDAPI layer to own the Vader 5 Pro as the visible controller, and suppresses the duplicate Linux/xpad joystick. Ordinary rumble is sent through the hidden xpad `FF_RUMBLE` event device when available, falling back to the raw Flydigi grip-rumble packet if it is not.
+- Native Linux Steam installation with `steamrt64/` (Flatpak Steam is not supported).
+- `git`, `patch`, `python3`, `binutils` (`readelf`, `nm`), and `podman` or `docker` for Sniper SDK builds (or host `gcc`, `cmake`, `ninja`, and SDL3 dev headers when passing `--native`).
 
 ## File layout
 
+```text
+~/sdl-build/SDL-main-vader5/                     # SDL3 source and build directory
+~/.local/share/vader5-driver/backups/steamrt64/  # stock Steam libSDL3 backups
+~/.local/share/vader5-driver/deployed/steamrt64/ # SHA-256 receipts of deployed files
+~/.local/share/vader5-driver/sdl/libSDL3-64.so.0 # unpadded build for local probe tools
+/etc/udev/rules.d/60-vader5-sdl.rules            # user hidraw ACL rule
 ```
-~/sdl-build/SDL-main-vader5/                   # patched SDL source
-~/sdl-build/SDL-main-vader5/build-steam32/     # 32-bit patched SDL build
-~/sdl-build/SDL-main-vader5/build-steam64/     # 64-bit patched SDL build
-
-~/.local/share/vader5-driver/sdl/libSDL3-32.so.0   # deployed 32-bit SDL
-~/.local/share/vader5-driver/sdl/libSDL3-64.so.0   # deployed 64-bit SDL
-~/.local/share/vader5-driver/sdl/sdl3_shim32.so    # optional SDL_TryLockJoysticks shim
-~/.local/share/vader5-driver/sdl/sdl3_shim64.so    # optional SDL_TryLockJoysticks shim
-~/.local/share/vader5-driver/wrapper.sh             # bwrap launcher
-
-# One of the following, depending on distro/setup:
-~/.config/systemd/user/steam-launcher.service.d/override.conf
-~/.local/share/applications/steam.desktop
-
-/etc/udev/rules.d/60-vader5-sdl.rules
-```
-
-Nothing is written under `/usr`, `/usr/local`, or Steam's own file tree.
-
-## Pre-flight
-
-The install script offers to install missing build tools automatically. To install manually:
-
-**Arch / SteamOS / CachyOS:**
-```sh
-sudo pacman -S --needed cmake ninja git patch gcc-multilib lib32-glibc lib32-gcc-libs bubblewrap patchelf
-```
-
-**Fedora / Bazzite / Nobara:**
-```sh
-sudo dnf install -y cmake ninja-build git gcc patch bubblewrap patchelf \
-    glibc-devel.i686 libstdc++-devel.i686 \
-    libX11-devel.i686 libXext-devel.i686 \
-    libXcursor-devel.i686 libXi-devel.i686 \
-    libXfixes-devel.i686 libXrandr-devel.i686 \
-    libXrender-devel.i686 libXinerama-devel.i686 \
-    libXScrnSaver-devel.i686 libXtst-devel.i686
-```
-
-**Ubuntu / Debian:**
-```sh
-sudo apt-get install -y cmake ninja-build git gcc gcc-multilib patch bubblewrap patchelf
-```
-
-On SteamOS, run `passwd` first if you haven't set a sudo password.
-
-## Survives updates?
-
-Yes. The patched SDL and wrapper live in `~/.local/share/vader5-driver/` and the systemd or desktop wiring lives in `~/.config/` or `~/.local/share/applications/` — all of which persist across Steam updates and SteamOS A/B partition updates. The udev rule lives under `/etc/`, which is overlayfs-backed on SteamOS. Steam's own files are never modified.
-
-If Steam ships an SDL update that includes the fix natively, re-run the install script (it's idempotent) to rebuild and verify.
-
-## FAQ
-
-**Will the patched minimal SDL interfere with games, Vulkan, Wine Wayland, or HDR?**
-
-No. This project replaces **Steam's client SDL**, not the SDL used by games.
-
-- Games launched through Pressure Vessel use their own runtime container and their own SDL stack.
-- Native Linux games that ship SDL usually bundle their own copy alongside the game.
-- `SDL_VULKAN=OFF` in the patched build only affects the Steam client itself, which uses OpenGL for its UI.
-- Wine's Wayland driver, HDR path, and game rendering stack do not depend on Steam's client SDL.
-- Steam overlay rendering still works because the client build keeps the pieces Steam actually uses: `OpenGL`, `X11`, and `HIDAPI`.
-
-In short: this patch should not block Vulkan games, Wine Wayland, or HDR, because it does not replace a system SDL or the SDL inside game runtimes.
-
-**Is there any realistic VAC risk?**
-
-Probably not.
-
-- VAC targets game processes, memory tampering, hooks, and cheat signatures inside games.
-- This project does not inject into game processes, preload into games, or modify game files.
-- The only SDL being redirected is the Steam client's own SDL at `ubuntu12_32/libSDL3.so.0` and `ubuntu12_64/libSDL3.so.0`.
-- The `bwrap` mount-namespace mechanism is the same class of tool Valve already uses for Pressure Vessel on Linux.
-
-The risky approaches would have been things like `LD_PRELOAD` into games, code injection into running games, or modifying files inside a game's own runtime. This project does none of those.
-
-**What has to change upstream for this project to become unnecessary?**
-
-This project stops being necessary when the Linux stack handles the real controller correctly by default.
-
-Required changes:
-
-- **SDL must include the Vader 5 Pro Linux fix.** The Flydigi HIDAPI backend needs to select interface 1, send the init/test-mode sequence, and handle the controller's unnumbered fixed-size 32-byte reports for input, status, and rumble/output writes.
-- **Steam must ship a Linux client build that includes that SDL fix.** It is not enough for the patch to exist upstream in SDL; the Steam client on Linux has to actually bundle and use it.
-- **Linux-side access to the real Flydigi `hidraw` interface must work without local overrides.** If Steam cannot open the controller's vendor HID interface as the logged-in user, the local udev rule is still needed.
-- **The generic `xpad` path must stop winning over the real Flydigi HID path.** The local SDL patch currently hides the duplicate xpad joystick while keeping xpad available for haptics.
-
-Who needs to change what:
-
-- **SDL:** merge and ship the protocol fix.
-- **Valve / Steam:** bundle a Steam-for-Linux client SDL with that fix.
-- **Linux distro / local OS setup:** make sure the real Flydigi HID interface is accessible and not masked by the generic Xbox path.
 
 ## Troubleshooting
 
-**Controller still shows as Generic X-Box pad after install:**
+**Controller shows as Generic X-Box pad:**
 
-1. Replug or power-cycle the controller so both the xpad and hidraw interfaces are present.
-2. Confirm the wrapper is active:
+1. Confirm the firmware third-party flag is enabled:
    ```sh
-   systemctl --user status steam-launcher.service | grep ExecStart
-   # Should show vader5-driver/wrapper.sh
+   ./tools/vader5-thirdparty.py status
    ```
-   Confirm the patched SDL is loaded:
+   If `Third-party: disabled`, run `./tools/vader5-thirdparty.py enable`.
+2. Confirm Steam is running with the patched SDL3 and HIDAPI driver:
    ```sh
-   pid=$(pgrep -f 'ubuntu12_32/steam ' | head -1)
-   grep libSDL3 /proc/$pid/maps | sort -u
-   # Should show vader5-driver/sdl/libSDL3-32.so.0
+   grep -n 'Flydigi\|Vader\|HIDAPI\|37d7\|2401' ~/.local/share/Steam/logs/controller.txt | tail -40
    ```
-3. Confirm xpad is bound:
+3. Confirm `xpad` is bound to interface 0:
    ```sh
    ls /sys/bus/usb/drivers/xpad/
-   # Should show the Vader's interface (e.g. 3-1:1.0)
-   ```
-4. Check Steam's controller log:
-   ```sh
-   grep -n 'Flydigi\|Vader\|HIDAPI' ~/.local/share/Steam/logs/controller.txt | tail -40
    ```
 
-The visible Steam controller should still be the Flydigi HIDAPI controller, not the generic xpad device. The xpad event node is kept only as the ordinary-rumble backend.
+**After a Steam client update:**
 
-**Build fails at 32-bit cmake:**
-
-```sh
-ls /usr/lib32/pkgconfig/ | grep -E '^x11|xext'
-sudo pacman -S --needed lib32-libx11 lib32-libxext   # Arch/SteamOS
-# or: sudo apt-get install -y libx11-dev:i386 libxext-dev:i386   # Ubuntu
-```
-
-**SDL patch doesn't apply:**
-
-The patch targets SDL `main` as used by `~/sdl-build/SDL-main-vader5`. If you point the installer at a different SDL tree and the file layout has changed, apply the patch manually. If `SDL_HIDAPI_Flydigi_SendVader5InitSequence` already exists in the source, this specific patch is already applied.
+Steam overwrites `steamrt64/libSDL3.so.0` when updating the client. Close Steam and re-run `bash scripts/install.sh` to re-deploy against the updated client (once Valve bundles the same upstream SDL3 changes, the third-party flag and udev rule alone are enough unless you also want the `xpad` ordinary-rumble backend).

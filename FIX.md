@@ -1,296 +1,107 @@
-# Vader 5 Pro Steam Fix Notes
+# Vader 5 Pro Linux & Steam Technical Notes
 
-This file records the working Linux/Steam approach for the Flydigi Vader 5 Pro
-and the debugging findings that led to it.
+Reference notes for the Flydigi Vader 5 Pro (`37d7:2401`) Linux HIDAPI stack, firmware third-party flag, rumble behavior, and validation workflow.
 
-## Current Result
+## Architecture Overview
 
-The controller works through Steam Input using SDL HIDAPI, including:
+The setup operates directly through Steam's native 64-bit `steamrt64` client and SDL3's `SDL_HIDAPI_DriverFlydigi`:
 
-- Standard controller inputs.
-- Extra surface exposed by SDL/Steam: M1-M4, LM, RM, C, Z, and related misc buttons.
-- Steam Input remapping for paddles and extra buttons.
-- Gyro and extended settings visible in Steam's controller UI.
-- Ordinary rumble routed through the hidden xpad Linux `FF_RUMBLE` path, with
-  raw Flydigi trigger-rumble slots still exposed for callers that use SDL's
-  trigger-rumble API.
+1. `xpad` stays bound to USB interface 0 (`:1.0`) for kernel Linux `FF_RUMBLE` force feedback.
+2. `/etc/udev/rules.d/60-vader5-sdl.rules` grants the active desktop user `uaccess` read/write access to the `37d7:2401` `/dev/hidraw*` vendor interface (`:1.1`).
+3. The controller's persistent firmware flag (`ThirdPartyEnabled=1`) allows third-party HIDAPI hosts (including SDL3) to acquire the controller via command `0x1C` (`owner="SDL"`).
+4. Upstream SDL3 `main` initializes the device (`0x07`, `0x01`, `0x10`, `0x1C`), decodes the 32-byte `5a a5 ef ...` extended reports (standard buttons, M1–M4, LM, RM, C, Z, Circle, triggers, sticks, gyro/accel, battery), and automatically hides the duplicate Linux `xpad` joystick via `HIDAPI_AddDeviceMatches` / `SDL_RemoveHiddenDevices`.
+5. [sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch) routes `SDL_RumbleGamepad` on Linux through the hidden `xpad` `/dev/input/event*` `FF_RUMBLE` endpoint (with fallback to `HIDAPI_DriverFlydigi_SendRumbleV2`) while leaving `SDL_RumbleGamepadTriggers` on upstream's four-motor Flydigi HID command (`0x12`).
+6. The library is built inside Valve's Steam Runtime 3 (`sniper`) SDK container (`registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest`), stripped, padded with trailing zero bytes to match Steam's manifest byte size, and installed directly into `~/.local/share/Steam/steamrt64/libSDL3.so.0` and `libSDL3.so`.
 
-Validated manually with:
+## Protocol Reference (Firmware `7.1.x`)
 
-- Warhammer: Vermintide 2: controller input, Steam Input remapping, paddles, and extra buttons worked.
-- Elden Ring Nightreign: initially behaved inconsistently, then worked after the final deployed build.
-- Rumble confirmed working after the V2 raw-rumble fix; later usbmon captures
-  showed the game's working trigger-feel path is ordinary xpad rumble.
+Commands on USB interface 1 use unnumbered 32-byte HID output reports (prefixed with a leading `0x00` report ID byte when writing to Linux `/dev/hidraw*`):
 
-Steam may still show a stale or generic UI label in some places. The reliable
-validation is the Steam controller log showing the HIDAPI device and full
-mapping, not the cached display label.
+- Frame layout: `5a a5 <cmd> <len> <payload...> <checksum>` zero-padded to 32 bytes.
+- Checksum: `sum(frame[2 : 2 + len]) & 0xff` (i.e., `cmd + len + sum(payload)` mod 256).
 
-## What Actually Works
+Key commands:
 
-The working stack is:
+| Command | Payload | Purpose |
+|---|---|---|
+| `0x01` (`GET_INFO`) | `5a a5 01 02 03` | Reads `deviceID` (`data[5]`), connection type (`data[6]`: `1`=wired, `2`=wireless), battery (`data[11]`), and firmware BCD (`(data[15] << 8) \| data[16]`, e.g. `0x7150` = `7.1.5.0`). |
+| `0x07` (`CHECK_ARCH`) | `5a a5 07 00 00` | Architecture query (`versionData[3] == 1 && versionData[4] == 0` indicates new architecture; `7.1.5.0` reports `0`). |
+| `0x10` (`GET_STATUS`) | `5a a5 10 02 12` | Returns 5 status bytes in `data[5..9]` and a NUL-terminated owner string at `data[10..]`. `data[9] == 1` is `ThirdPartyEnabled`. |
+| `0x11` (`SET_STATUS`) | `5a a5 11 07 ff ff ff ff <0\|1> <csum>` | Updates status flags (`0xff` = leave field unchanged). Setting byte 8 to `0x01` (checksum `0x15`) persists `ThirdPartyEnabled=1`; `0x00` (checksum `0x14`) sets `0`. Validated for `0x7141 <= fw < 0x7200`. |
+| `0x12` (`HAPTIC`) | `5a a5 12 06 <lg> <rg> <lt> <rt> 00 00` | Direct four-motor rumble intensities: left grip, right grip, left trigger, right trigger (`0x00`–`0xff`). |
+| `0x1C` (`ACQUIRE`) | `5a a5 1c 17 <0\|1> "SDL" ...` | Acquires or releases HIDAPI ownership when `ThirdPartyEnabled=1`. |
+| `0xEF` (`INPUT`) | `5a a5 ef ...` | 32-byte extended input + IMU streaming report. |
 
-1. `xpad` remains bound to the Vader's interface 0 for Linux force feedback.
-2. Steam is launched through `~/.local/share/vader5-driver/wrapper.sh`.
-3. The wrapper uses `bubblewrap` to bind-mount patched SDL over Steam's bundled SDL.
-4. Patched SDL selects Flydigi HIDAPI on interface 1.
-5. Patched SDL hides the duplicate xpad joystick from SDL/Steam.
-6. Patched SDL sends the same Vader 5 init/test-mode sequence that padctl uses.
-7. The controller streams `5a a5 ef ...` extended reports.
-8. Steam Input sees the full button surface through SDL HIDAPI.
-9. Ordinary rumble is sent through the hidden xpad event device when available.
+`tools/vader5-thirdparty.py` implements `status`, `enable`, and `disable` against `0x01`, `0x10`, and `0x11` with firmware-range validation and readback verification.
 
-This is deliberately not a userspace daemon or virtual Xbox/Elite controller.
-The controller stays visible to Steam as a real SDL HIDAPI gamepad with extended
-buttons.
+## Rumble Behavior
 
-## Important Validation Commands
+USB captures (`usbmon`) of games using ordinary two-motor Xbox rumble show standard `xpad` packets:
 
-Confirm Steam is loading the wrapper-mounted SDL:
-
-```sh
-pid=$(pgrep -f 'ubuntu12_32/steam ' | head -1)
-grep libSDL3 /proc/$pid/maps | sort -u
+```text
+00 08 00 <left> <right> 00 00 00
 ```
 
-Inside the wrapper namespace those paths may still print as Steam paths, so
-inode comparison is stronger:
+On the Vader 5 Pro, the firmware translates ordinary `xpad` force feedback on interface 0 into grip vibration with trigger participation, whereas the raw Flydigi HID command `5a a5 12 06 <lg> <rg> <lt> <rt>` addresses all four motors independently and leaves the trigger motors idle when `<lt>` and `<rt>` are zero.
+
+To preserve both behaviors:
+
+- Ordinary `SDL_RumbleGamepad` calls open the hidden `xpad` `/dev/input/event*` device matching `VID=0x37d7`, `PID=0x2401`, capability `FF_RUMBLE`, and sysfs interface symlink `/sys/class/input/eventN/device/device` ending in `:1.0` (one level deeper than `/sys/class/input/eventN/device`, which points to the intermediate `inputN` node).
+- Both `/dev/input/event*` and `/sys/class/input/eventN/device/device` are visible inside Steam's `steamrt3c` Pressure Vessel container, so the `xpad` rumble backend works inside Steam without extra container configuration.
+- Set `SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE=0` to force raw Flydigi HID rumble (`0x12`) for ordinary rumble calls.
+- `SDL_RumbleGamepadTriggers` always calls upstream `HIDAPI_DriverFlydigi_SendRumbleV2`, driving slots 2 and 3 directly.
+
+## Validation Commands
+
+### 1. Controller firmware flag
 
 ```sh
-pid=$(pgrep -f 'ubuntu12_32/steam ' | head -1)
-stat -c '%i %s %n' \
-  ~/.local/share/vader5-driver/sdl/libSDL3-32.so.0 \
-  /proc/$pid/root$HOME/.local/share/Steam/ubuntu12_32/libSDL3.so.0 \
-  ~/.local/share/vader5-driver/sdl/libSDL3-64.so.0 \
-  /proc/$pid/root$HOME/.local/share/Steam/ubuntu12_64/libSDL3.so.0
+./tools/vader5-thirdparty.py status
 ```
 
-The paired inodes should match.
+Expected output when Steam is running: `Third-party: enabled (flags=[0, 1, 0, 0, 1], owner=SDL)`.
 
-Confirm Steam's controller path:
+### 2. Steam loaded library check
+
+Verify that the live `steamrt64/steam` process maps the deployed `steamrt64/libSDL3.so.0` and that its SHA-256 matches the installer receipt:
+
+```sh
+sha256sum ~/.local/share/Steam/steamrt64/libSDL3.so.0
+cat ~/.local/share/vader5-driver/deployed/steamrt64/libSDL3.so.0.sha256
+```
+
+### 3. Steam controller log
 
 ```sh
 grep -n 'Flydigi\|Vader\|HIDAPI\|37d7\|2401' \
   ~/.local/share/Steam/logs/controller.txt | tail -80
 ```
 
-Good signs:
+Expected entries:
 
 - `Product: Flydigi Vader 5 Pro`
 - `Controller using HIDAPI driver, vid=0x37d7, pid=0x2401`
-- Mapping includes `paddle1` through `paddle4`
-- Mapping includes `misc2` through `misc6`
+- Full mapping containing `paddle1`–`paddle4` and `misc2`–`misc6`
+- Only one controller slot active (no duplicate `Generic X-Box pad`)
 
-Confirm `xpad` is owning interface 0:
+### 4. Kernel `xpad` binding
 
 ```sh
 ls /sys/bus/usb/drivers/xpad/ | grep ':1.0'
 ```
 
-For the Vader's USB path, interface `:1.0` should be bound to `xpad`.
+### 5. Standalone probe tools
 
-## What Not To Trust
-
-`evtest` alone is not the success test for this setup.
-
-The xpad `/dev/input/event*` device is intentionally present for force
-feedback, but it should not be the controller Steam exposes. Steam should use
-the SDL HIDAPI device on interface 1 for input and Steam Input mapping.
-
-Steam's display label can also be stale or misleading. A UI label like
-`Generic X-Box pad` does not necessarily mean the fix failed if the controller
-log shows the Flydigi HIDAPI mapping with paddles and misc buttons.
-
-## padctl Findings
-
-padctl proved the key protocol behavior:
-
-- The useful input path is interface 1, not the generic Xbox-facing interface.
-- Vader 5 Pro streams extended input as 32-byte reports beginning with
-  `5a a5 ef`.
-- The controller needs an init/test-mode sequence before reliable extended
-  streaming.
-- The important enable command is:
-
-```text
-5a a5 11 07 ff 01 ff ff ff 15 00
-```
-
-padctl's Vader 5 config sends these init commands before enabling test mode:
-
-```text
-5a a5 01 02 03
-5a a5 a1 02 a3
-5a a5 02 02 04
-5a a5 04 02 06
-5a a5 11 07 ff 01 ff ff ff 15 00
-```
-
-The SDL patch mirrors that behavior, but keeps Steam as the consumer instead of
-creating a virtual Xbox Elite Series 2 device.
-
-## Why Not Run padctl Together With This
-
-Running padctl and this SDL fix at the same time is the wrong model. Both want
-to open and control the same physical HID interface.
-
-padctl's model:
-
-- Reads the physical Vader interface.
-- Blocks kernel drivers as needed.
-- Emits a virtual controller through uinput/UHID.
-
-This repo's model:
-
-- Lets Steam's SDL open the physical Vader interface directly.
-- Avoids a virtual controller.
-- Lets Steam Input see and remap the extended buttons directly.
-
-The second model better matches the desired behavior: a real Steam Input
-controller with extra remappable buttons rather than an Xbox Elite emulation.
-
-## Patch Details
-
-The SDL patch currently does the following:
-
-- Forces `37d7:2401` interface 1 to use `SDL_HIDAPI_DriverFlydigi`.
-- Converts Flydigi V2 Vader interface-1 writes into raw 32-byte writes.
-- Sends the padctl-derived Vader 5 init sequence.
-- Replaces the older Flydigi acquire heartbeat with the Vader test-mode enable
-  command.
-- Keeps the device available instead of hiding it when the older acquire status
-  does not match expectations.
-- Sends Vader 5 Pro rumble through the same raw 32-byte interface-1 write path.
-- Exposes SDL trigger rumble for Vader 5 Pro and maps it to the two trigger
-  motors discovered with `tools/vader5_rumble_probe.c`.
-
-The rumble bug that was fixed late in testing:
-
-- The first patch put the Vader-specific raw rumble branch inside the V1 rumble
-  block.
-- Vader 5 Pro is V2, so rumble still used SDL's generic helper.
-- Moving that branch into the V2 path made SDL send `5a a5 12 06 ...` directly
-  through the raw write helper.
-
-The later four-motor rumble fix:
-
-- The validated raw payload is:
-
-```text
-5a a5 12 06 left_grip right_grip left_trigger right_trigger 00 00 ...
-```
-
-- `slot 0` / raw byte 4: left grip rumble.
-- `slot 1` / raw byte 5: right grip rumble.
-- `slot 2` / raw byte 6: left trigger rumble.
-- `slot 3` / raw byte 7: right trigger rumble.
-- `slot 4` and `slot 5` did not produce observable rumble in testing.
-- Pair tests worked for all four active motor slots.
-
-The SDL driver stores the last normal-rumble and trigger-rumble values in the
-Flydigi context and always sends one combined four-motor packet. This matters
-because SDL normal rumble and SDL trigger rumble are separate APIs, while the
-Vader 5 packet carries all motor intensities together.
-
-## Installer Findings
-
-Steam's current Linux client expects `SDL_TryLockJoysticks@@SDL3_0.0.0`.
-Older upstream SDL releases did not export it, which is why the original
-installer carried a shim.
-
-The current working installer builds SDL `main`, which already exports
-`SDL_TryLockJoysticks`. The shim is now optional:
-
-- If the built SDL exports `SDL_TryLockJoysticks`, no shim is installed.
-- If a user overrides `SDL_REF`/`SDL_SRC` to an older SDL tree, the shim path
-  remains available.
-
-The installer also handles a common cache failure:
-
-- If `~/sdl-build/SDL-main-vader5` exists but is not a git checkout, it now
-  reports a clear error instead of failing later with Git's generic
-  destination-path message.
-
-## Steam Update Behavior
-
-The wrapper bind-mounts patched SDL over Steam's bundled SDL inside a private
-mount namespace. Steam's own files on disk are not modified.
-
-Steam may log verifier messages because, inside the wrapper namespace, its SDL
-paths resolve to files with different sizes. That is expected. The important
-property is that the verifier cannot replace the host files because the patched
-files are only mounted over Steam's paths inside the wrapper namespace.
-
-On newer Steam clients, especially the public beta seen on June 7, 2026, the
-client may try to repair the bind-mounted SDL files on each launch and then
-exit when the bind mount prevents renaming `libSDL3.so.0`. The wrapper now
-passes Steam's own `-noverifyfiles -norepairfiles` flags to avoid that repair
-loop while still leaving Steam's host files untouched.
-
-If the beta client keeps forcing bootstrap repairs, disable the beta once with:
+Close Steam before running hardware probes to avoid concurrent HID reads/writes:
 
 ```sh
-mv ~/.local/share/Steam/package/beta ~/.local/share/Steam/package/beta.disabled-vader5
-/usr/bin/steam
-```
-
-After Steam finishes switching channels, close it and relaunch through
-`~/.local/share/vader5-driver/wrapper.sh`.
-
-## Known Caveats
-
-- Flatpak Steam is not supported.
-- Steam UI labels can be stale; validate with `controller.txt`.
-- Replugging or power-cycling the controller may be needed if the xpad or
-  hidraw interface was already in a stale state before install.
-- The fix depends on Steam using its bundled SDL path that the wrapper mounts.
-- If Steam updates its client SDL ABI again, rebuilding SDL `main` may be needed.
-- Game-specific Steam Input quirks can still exist even when the controller path
-  is correct.
-
-## Rumble Probe Notes
-
-`tools/vader5_rumble_probe.c` sweeps the rumble payload slots and records
-which physical motor responds. It was used to identify the trigger motors and
-is still useful if a future firmware revision changes the packet layout.
-
-```sh
-cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
-
-# Close Steam first so it is not also writing HID packets.
-/tmp/vader5_rumble_probe /dev/hidrawN
-```
-
-The confirmed Vader 5 Pro rumble command payload is:
-
-```text
-5a a5 12 06 left_grip right_grip left_trigger right_trigger 00 00 ...
-```
-
-Steam does not reliably send SDL's separate trigger-rumble call for games that
-only expose ordinary two-motor rumble. usbmon captures from the working xpad
-state showed the game sending compact xpad packets shaped like:
-
-```text
-00 08 00 left right 00 00 00
-```
-
-That means the observed trigger feel comes from the controller firmware's
-Xbox-compatible ordinary-rumble behavior, not independent trigger-rumble data.
-The patched SDL therefore sends ordinary rumble through the hidden xpad
-`FF_RUMBLE` device when available. SDL trigger-rumble calls still use raw
-Flydigi slots 2/3.
-
-`tools/sdl_rumble_probe.c` tests the deployed SDL path rather than raw hidraw:
-
-```sh
-rm -rf /tmp/vader5-sdl-probe-lib
-mkdir -p /tmp/vader5-sdl-probe-lib
+# Test SDL3 gamepad enumeration, mapping, ordinary xpad rumble, and trigger rumble:
+rm -rf /tmp/vader5-sdl-probe-lib && mkdir -p /tmp/vader5-sdl-probe-lib
 ln -s "$HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0" \
   /tmp/vader5-sdl-probe-lib/libSDL3.so.0
 
 cc tools/sdl_rumble_probe.c \
-  -I/home/lobo/sdl-build/SDL-main-vader5/include \
+  -I"$HOME/sdl-build/SDL-main-vader5/include" \
   -L/tmp/vader5-sdl-probe-lib \
   -Wl,-rpath,/tmp/vader5-sdl-probe-lib \
   -l:libSDL3.so.0 \
@@ -299,54 +110,16 @@ cc tools/sdl_rumble_probe.c \
 /tmp/sdl_rumble_probe
 ```
 
-## Steam Input UI Quirks
+Additional probes under `tools/`:
 
-Assigning extra buttons through Steam Input's normal picker writes a clean
-mapping and works reliably. The `Listen` assignment path can create redundant
-commands for some extra-button-to-stick-click mappings. This appears to be in
-Steam Input's layout editor rather than the SDL event stream: normal buttons
-map cleanly, while the extra Vader controls pass through Steam's generic
-`switches` source group and can be aliased with stick-click commands.
+- `tools/sdl_event_probe.c` — prints live SDL3 button and axis events.
+- `tools/vader5_rumble_probe.c` — sweeps raw `5a a5 12 06 ...` payload slots directly over `/dev/hidrawN`.
+- `tools/vader5_raw_probe.c` — dumps raw 32-byte `hidraw` reports.
 
-The practical workaround is to use the picker/controller drawing for extra
-buttons when targeting stick clicks, then remove any duplicate subcommand if
-`Listen` created one.
+## Known Caveats
 
-## Duplicate xpad Device
-
-The old fix unbound xpad to avoid Steam showing both the HIDAPI controller and
-a generic Xbox controller. The current fix keeps xpad bound for haptics and
-patches SDL so the Linux/xpad joystick is considered handled by the higher
-priority HIDAPI driver. Root is only needed at install time for the udev rule
-and deployed files.
-
-## Useful Diagnostic Tools
-
-`tools/vader5_raw_probe.c` writes the padctl-derived init/test-mode commands to
-a chosen `/dev/hidraw*` node and dumps raw reports. It is useful for confirming
-that the physical controller streams `5a a5 ef ...`.
-
-`tools/vader5_rumble_probe.c` sweeps the Vader 5 rumble payload bytes so the
-physical motor layout can be discovered safely before adding SDL trigger rumble
-support.
-
-`tools/sdl_event_probe.c` opens SDL gamepads and prints button/axis events. It
-is useful for checking whether SDL sees the extended buttons without relying on
-Steam's UI.
-
-Compile examples:
-
-```sh
-cc tools/vader5_raw_probe.c -o /tmp/vader5_raw_probe
-
-cc tools/vader5_rumble_probe.c -o /tmp/vader5_rumble_probe
-
-cc tools/sdl_event_probe.c \
-  -I$HOME/sdl-build/SDL-main-vader5/include \
-  $HOME/.local/share/vader5-driver/sdl/libSDL3-64.so.0 \
-  -Wl,-rpath,$HOME/.local/share/vader5-driver/sdl \
-  -o /tmp/sdl_event_probe
-```
-
-Do not run the raw probe while Steam is actively using the controller unless
-you are intentionally testing device contention.
+- Flatpak Steam is not supported.
+- Steam Input's `Listen` binding helper can emit duplicate subcommands when binding extra buttons to stick clicks; assign those through the visual picker instead.
+- Steam's UI display label can briefly show a cached string even when `controller.txt` confirms the HIDAPI Flydigi mapping; trust `controller.txt`.
+- Steam client updates overwrite `steamrt64/libSDL3.so*` with new stock files; re-run `bash scripts/install.sh` afterwards to re-apply the patched library cleanly.
+- Observe-only companion daemons (such as `vader5-actions` reading `/dev/hidraw*` passively without writing commands) can run alongside Steam cleanly once `ThirdPartyEnabled=1` is active.
