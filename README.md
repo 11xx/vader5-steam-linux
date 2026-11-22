@@ -1,108 +1,110 @@
-# Flydigi Vader 5 Pro — native SDL3 HIDAPI on Linux
+# Flydigi Vader 5 Pro on Linux & Steam
 
-Enables native Flydigi Vader 5 Pro (`37d7:2401`) support in Steam on Linux with full Steam Input access to M1–M4, LM, RM, C, Z, Circle, gyro, and Xbox-compatible ordinary rumble plus trigger rumble—without Windows, Flydigi Space Station, virtual controllers, or launcher wrappers.
+Native SDL3 HIDAPI support for the Flydigi Vader 5 Pro (`37d7:2401`) on Linux—giving Steam Input direct access to **M1–M4, LM, RM, C, Z, Circle, gyro/accel, 4-motor trigger rumble, and Xbox-compatible ordinary rumble** with **no Windows VM, no Flydigi Space Station, no virtual Xbox controller, and no Steam launcher wrappers**.
+
+## Why this exists
+
+Out of the box on Linux, three gaps keep the Vader 5 Pro from working properly in Steam:
+
+1. **Onboard third-party lock:** Firmware `7.1.x` ships with `ThirdPartyEnabled=0`, which blocks SDL3 from acquiring USB interface 1 and forces Steam back to the generic Xbox controller on interface 0 (`xpad`). Flydigi only exposes that toggle in the Windows Space Station app.
+2. **Steam's bundled SDL3 lags upstream:** Even with the flag enabled, Steam's shipped `libSDL3.so.0` can lag behind upstream SDL3 `main` fixes for Vader 5 Pro.
+3. **Ordinary game rumble vs. trigger feel:** Games that send standard two-motor Xbox rumble (`SDL_RumbleGamepad`) rely on the controller firmware's `xpad` force-feedback path on interface 0 to engage the trigger motors alongside the grips. Pure Flydigi HID rumble (`0x12`) only shakes the grips unless a game explicitly calls `SDL_RumbleGamepadTriggers`.
+
+| Capability | Stock Linux (`xpad`) | Upstream SDL3 + flag | This setup |
+|---|:---:|:---:|:---:|
+| Extra buttons (M1–M4, LM, RM, C, Z, Circle) | No | Yes | Yes |
+| Gyro / IMU + battery telemetry | No | Yes | Yes |
+| Single controller in Steam (no duplicate pad) | Yes | Yes | Yes |
+| Ordinary 2-motor game rumble with firmware trigger feel | Yes | Grips only | Yes |
+| Independent 4-motor `SDL_RumbleGamepadTriggers` | No | Yes | Yes |
+| Enable firmware flag directly from Linux (no Windows) | No | No | Yes |
+| Normal Steam launches & self-updates (no wrapper) | Yes | Yes | Yes |
+
+## Architecture
+
+```text
+Vader 5 Pro (37d7:2401)
+ ├── USB Interface 0 (xpad)
+ │    └── /dev/input/event* (hidden from Steam, opened privately for FF_RUMBLE)
+ │                                              ▲
+ └── USB Interface 1 (vendor HID)               │ ordinary 2-motor rumble
+      └── /dev/hidraw* (uaccess via udev rule)  │
+           ├── tools/vader5-thirdparty.py  ──► persistent ThirdPartyEnabled=1 (0x11)
+           └── steamrt64/libSDL3.so.0      ──► Steam Input (M1–M4, LM/RM, C/Z, O, gyro, 4-motor rumble)
+                (Sniper SDK build + xpad FF patch, size-padded to Steam manifest)
+```
+
+- **No virtual controller:** Steam talks directly to the physical Flydigi HID interface.
+- **No `bwrap` or `.desktop` wrapper:** The built library is compiled inside Valve's Steam Runtime 3 (`sniper`) SDK container (`<= GLIBC_2.31`, `SDL_WAYLAND=OFF` so `steamwebhelper` always receives an X11/XWayland window handle) and padded with trailing zero bytes to match Steam's exact manifest byte size. Steam's startup check (`Verifying file sizes only`) passes untouched, and Steam client updates overwrite the file cleanly without `EBUSY` failures.
+- **Pre-deploy safety gates:** Before touching any Steam file, the installer verifies `ELF64`, `SONAME`, `RUNPATH=$ORIGIN`, size headroom, and 100% symbol coverage across every binary in `steamrt64/*`, and saves a receipt-guarded backup of Steam's stock libraries.
 
 ## Prerequisites
 
-- Native Linux Steam installation with `steamrt64/` (Flatpak Steam is not supported).
+- Native 64-bit Linux Steam (`~/.local/share/Steam/steamrt64/`; Flatpak Steam is not supported).
 - `git`, `patch`, `python3`, `binutils` (`readelf`, `nm`), and `podman` (recommended) or `docker`:
-  - Arch / SteamOS / CachyOS: `sudo pacman -S --needed git patch python binutils podman`
-  - Fedora / Bazzite: `sudo dnf install -y git patch python3 binutils podman`
-  - Ubuntu / Debian: `sudo apt-get install -y git patch python3 binutils podman`
+  - **Arch / SteamOS / CachyOS:** `sudo pacman -S --needed git patch python binutils podman`
+  - **Fedora / Bazzite:** `sudo dnf install -y git patch python3 binutils podman`
+  - **Ubuntu / Debian:** `sudo apt-get install -y git patch python3 binutils podman`
 
 ## Install
 
-Close Steam first, wake or plug in the controller, and run:
+1. Close Steam completely (`steam -shutdown` or Quit from the tray).
+2. Wake or plug in the Vader 5 Pro.
+3. Run:
+   ```sh
+   make install
+   ```
+4. Launch Steam normally.
 
-```sh
-bash scripts/install.sh
-```
+In **Steam → Settings → Controller → Detected Controllers**, you should see a single **Flydigi Vader 5 Pro** with the full extended button layout available in Steam Input.
 
-The installer:
+> **Note on the first run:** `make install` pulls the SteamRT Sniper SDK image once (~1.3 GiB), checks out a pinned, tested SDL3 commit so the patch applies cleanly without manual conflict resolution, builds `libSDL3.so.0`, installs `/etc/udev/rules.d/60-vader5-sdl.rules`, and flips `ThirdPartyEnabled=1` in the controller's flash. Subsequent runs reuse the cached image and build and finish in a few seconds.
 
-1. Checks out a pinned, tested upstream SDL3 revision and applies [sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch).
-2. Builds 64-bit `libSDL3.so.0` inside Valve's Steam Runtime 3 (`sniper`) SDK container (`podman` or `docker`; `--native` is available for host toolchains).
-3. Verifies ELF metadata, ABI (`SONAME`, `RUNPATH=$ORIGIN`), size headroom, and full symbol coverage against Steam's `steamrt64/` binaries.
-4. Backs up Steam's stock `steamrt64/libSDL3.so.0` and `steamrt64/libSDL3.so`, then installs the patched library padded with trailing zero bytes to match Steam's manifest file size.
-5. Installs `/etc/udev/rules.d/60-vader5-sdl.rules` for user-level `/dev/hidraw*` access.
-6. Enables the controller's persistent third-party mapping firmware flag (`0x11` command) via [tools/vader5-thirdparty.py](tools/vader5-thirdparty.py).
+## Day-to-day commands
 
-Start Steam normally afterwards. In **Steam → Settings → Controller → Detected Controllers**, the controller appears as **Flydigi Vader 5 Pro** with the full extended button surface visible in Steam Input.
+Run `make` with no arguments to see all targets:
 
-Useful installer flags:
+| Command | When to use it |
+|---|---|
+| `make install` | First install, or re-applying after a Steam client update |
+| `make uninstall` | Restore Steam's stock `libSDL3.so*` and remove installed files |
+| `make update-sdl` | Opt into latest upstream SDL3 `main` and rebuild |
+| `make rebuild` | Force a clean CMake reconfigure and rebuild |
+| `make status` | Check firmware version, battery, `ThirdPartyEnabled`, and current HID owner |
+| `make enable` / `make disable` | Toggle `ThirdPartyEnabled` directly over Linux `hidraw` (`7.1.x` firmware) |
+| `make check` | Lint `scripts/install.sh` and `scripts/uninstall.sh` |
 
-- `bash scripts/install.sh` — re-deploy after a Steam update (fast, reuses existing build)
-- `bash scripts/install.sh --update-sdl` — fetch latest upstream SDL3 `main`, re-apply the patch, and rebuild
-- `bash scripts/install.sh --rebuild` — clean CMake reconfigure and rebuild of the current checkout
-- `bash scripts/uninstall.sh` — restore Steam's stock `libSDL3.so*` and remove installed files
+To force raw Flydigi HID rumble instead of the hidden `xpad` backend for ordinary rumble, set `SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE=0`.
 
-For protocol details, validation commands, and rumble notes, see [FIX.md](FIX.md).
+## Updating & uninstalling
 
-## Firmware third-party mapping switch
-
-Vader 5 Pro firmware (`7.1.x`, `>= 0x7141`) gates its Flydigi HIDAPI acquire handshake (`0x1C`) behind a persistent onboard flag (`ThirdPartyEnabled`, byte 9 of the `0x10` status response). When that flag is `0`, SDL3 leaves the HIDAPI device unavailable and Steam falls back to the generic Xbox controller on interface 0.
-
-[tools/vader5-thirdparty.py](tools/vader5-thirdparty.py) inspects and toggles that flag directly over Linux `hidraw`:
-
-```sh
-./tools/vader5-thirdparty.py status
-./tools/vader5-thirdparty.py enable
-./tools/vader5-thirdparty.py disable
-```
-
-The flag persists in the controller's onboard flash across power cycles and reconnects. The `enable`/`disable` write checks that the controller is running validated `7.1.x` firmware (`0x7141`–`0x71ff`) before sending the `0x11` command.
-
-## How it works
-
-### USB interface layout
-
-The Vader 5 Pro exposes two USB interfaces:
-
-| Interface | Driver | Role |
-|---|---|---|
-| 0 (XInput) | `xpad` kernel module | Standard Xbox input and Linux `FF_RUMBLE` force feedback |
-| 1 (Flydigi HID) | SDL3 HIDAPI (`SDL_HIDAPI_DriverFlydigi`) | 32-byte unnumbered reports (`5a a5 ef ...`) carrying M1–M4, LM, RM, C, Z, Circle, IMU, battery, and 4-motor rumble |
-
-Upstream SDL3 handles the Vader 5 Pro HIDAPI protocol, button/axis/IMU decoding, four-motor HID rumble (`0x12`), hotplug reacquire, and automatic hiding of the duplicate Linux `xpad` joystick once the controller's third-party flag is enabled.
-
-### Why the local SDL patch exists
-
-Games that drive ordinary two-motor Xbox rumble (`SDL_RumbleGamepad`) rely on the controller firmware's Xbox-compatible rumble path on interface 0 (`xpad`) to produce trigger participation alongside grip vibration. Sending two-motor rumble exclusively over the raw Flydigi HID command (`5a a5 12 ...`) only drives the grip motors unless the caller explicitly invokes `SDL_RumbleGamepadTriggers`.
-
-[sdl-flydigi-vader5-linux.patch](sdl-flydigi-vader5-linux.patch) keeps `xpad` bound to interface 0, lets upstream SDL3 hide the duplicate `xpad` joystick from applications, and routes ordinary `SDL_RumbleGamepad` calls for `37d7:2401` through that hidden `/dev/input/event*` `FF_RUMBLE` node (matched via `/sys/class/input/eventN/device/device` → `:1.0`). If the `xpad` event node is unavailable—or if `SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE=0` is set—it falls back to upstream `HIDAPI_DriverFlydigi_SendRumbleV2`. Direct trigger-rumble calls (`SDL_RumbleGamepadTriggers`) always use upstream's 4-motor Flydigi HID path.
-
-### Direct Steam deployment and Sniper SDK ABI
-
-The Linux Steam client runs natively as 64-bit `steamrt64/steam` inside Steam Runtime 3 (`steamrt3c` Pressure Vessel) and links `steamrt64/libSDL3.so.0` via `DT_NEEDED` with `RUNPATH=$ORIGIN`.
-
-- Building inside `registry.gitlab.steamos.cloud/steamrt/sniper/sdk:latest` targets the exact Steam Runtime 3 glibc ABI (`<= GLIBC_2.31`) with the same dynamically loaded SDL3 feature set Valve ships (`*_SHARED=ON` for X11, PipeWire, PulseAudio, ALSA, DBus, libusb, Vulkan, OpenGL, and GPU, with `SDL_WAYLAND=OFF` so `steamwebhelper` always receives an X11/XWayland window handle) while keeping `DT_NEEDED` minimal (`libc`, `libm`, `libdl`, `libpthread`).
-- Steam's startup bootstrapper checks manifest file sizes (`Verifying file sizes only`) on normal launches. Padding the stripped `libSDL3.so.0` with trailing zero bytes to match the stock library's exact byte size lets Steam launch directly without wrappers or repair loops; the ELF loader ignores trailing bytes past the loadable segments.
-- When Steam ships a client update, Steam replaces `steamrt64/libSDL3.so*` cleanly with its new stock copy. Close Steam and re-run `bash scripts/install.sh` to capture the new stock backup and re-apply the patched library for the updated size.
+- **After a Steam client update:** Let Steam update normally, close Steam, and run `make install`. The installer detects Steam's new stock binary, refreshes its stock backup automatically, re-pads to the new manifest size, and redeploys.
+- **Uninstalling:** Close Steam and run `make uninstall`. It only restores backed-up files if Steam's copy still matches the deployed SHA-256 receipt (so it will never overwrite a newer Steam update unless you pass `--force` to `scripts/uninstall.sh`). The controller's flash flag is left untouched; run `make disable` if you also want to turn `ThirdPartyEnabled` off.
 
 ## File layout
 
 ```text
-~/sdl-build/SDL-main-vader5/                     # SDL3 source and build directory
+~/sdl-build/SDL-main-vader5/                     # SDL3 source and Sniper build tree
 ~/.local/share/vader5-driver/backups/steamrt64/  # stock Steam libSDL3 backups
 ~/.local/share/vader5-driver/deployed/steamrt64/ # SHA-256 receipts of deployed files
-~/.local/share/vader5-driver/sdl/libSDL3-64.so.0 # unpadded build for local probe tools
-/etc/udev/rules.d/60-vader5-sdl.rules            # user hidraw ACL rule
+~/.local/share/vader5-driver/sdl/libSDL3-64.so.0 # unpadded build for standalone probes
+/etc/udev/rules.d/60-vader5-sdl.rules            # user hidraw uaccess ACL rule
 ```
+
+## Companion tools & further reading
+
+- **Desktop hotkeys alongside Steam:** Because `ThirdPartyEnabled=1` streams standard `5a a5 ef` extended reports on `/dev/hidraw*`, an observe-only userspace daemon such as [vader5-actions](https://github.com/11xx/vader5-actions) can bind extra buttons and chords to desktop shortcuts or shell commands concurrently without interfering with Steam Input.
+- **Deep dive & diagnostics:** See [FIX.md](FIX.md) for the `7.1.x` HID protocol table, rumble internals, log validation commands, and standalone C probes (`tools/sdl_rumble_probe.c`, `tools/sdl_event_probe.c`).
 
 ## Troubleshooting
 
-**Controller shows as Generic X-Box pad:**
-
-1. Confirm the firmware third-party flag is enabled:
-   ```sh
-   ./tools/vader5-thirdparty.py status
-   ```
-   If `Third-party: disabled`, run `./tools/vader5-thirdparty.py enable`.
-2. Confirm Steam is running with the HIDAPI Flydigi driver:
-   ```sh
-   grep -n 'Flydigi\|Vader\|HIDAPI\|37d7\|2401' ~/.local/share/Steam/logs/controller.txt | tail -40
-   ```
-3. Confirm `xpad` is bound to interface 0:
-   ```sh
-   ls /sys/bus/usb/drivers/xpad/
-   ```
+- **Shows as `Generic X-Box pad`:** Run `make status`. If `Third-party: disabled`, run `make enable` while the pad is awake, then restart Steam.
+- **Verify Steam's controller path:**
+  ```sh
+  grep -n 'Flydigi\|Vader\|HIDAPI\|37d7\|2401' ~/.local/share/Steam/logs/controller.txt | tail -40
+  ```
+- **Verify `xpad` is still bound for haptics:**
+  ```sh
+  ls /sys/bus/usb/drivers/xpad/
+  ```
+- **Don't want containers?** Run `bash scripts/install.sh --native` to compile with host `gcc`/`cmake`/`ninja` and local SDL3 dev headers (Sniper SDK is strongly preferred for exact Steam Runtime 3 ABI parity).
