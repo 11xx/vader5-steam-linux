@@ -66,25 +66,58 @@ _restore_file() {
     local backup="$BACKUP_DIR/$rel_path"
     local receipt="$RECEIPT_DIR/$rel_path.sha256"
 
-    [[ -f "$backup" ]] || return 0
-    if [[ -z "$STEAM_ROOT" ]]; then
-        warn "Steam directory not found; cannot restore $rel_path"
+    if [[ ! -e "$backup" && ! -L "$backup" && ! -e "$receipt" && ! -L "$receipt" ]]; then
         return 0
+    fi
+    if [[ -z "$STEAM_ROOT" ]]; then
+        err "Steam directory not found; cannot restore $rel_path (recovery state retained)"
+        return 1
+    fi
+    if [[ ! -f "$backup" ]]; then
+        err "Missing stock backup for $rel_path (recovery state retained)"
+        return 1
     fi
 
     local dst="$STEAM_ROOT/$rel_path"
-    if [[ -f "$dst" && "$FORCE" != "1" && -f "$receipt" ]]; then
-        local cur_sha rec_sha
+    if [[ "$FORCE" != "1" && -L "$dst" ]]; then
+        info "$rel_path is now a symlink; keeping Steam's current path"
+        return 0
+    fi
+    if [[ -e "$dst" && ! -f "$dst" && ! -L "$dst" ]]; then
+        err "Not a regular library: $dst (recovery state retained)"
+        return 1
+    fi
+    if [[ -f "$dst" && "$FORCE" != "1" ]]; then
+        local cur_sha rec_sha=""
         cur_sha="$(sha256sum "$dst" | awk '{print $1}')"
-        rec_sha="$(cat "$receipt")"
-        if [[ "$cur_sha" != "$rec_sha" ]]; then
+        if [[ -e "$receipt" || -L "$receipt" ]]; then
+            rec_sha="$(cat "$receipt")"
+        fi
+        if [[ -z "$rec_sha" ]]; then
+            if cmp -s "$dst" "$backup"; then
+                info "$rel_path is already stock"
+                return 0
+            fi
+            err "Missing receipt for $rel_path; use --force to restore explicitly (recovery state retained)"
+            return 1
+        fi
+        if grep -qEv '^[0-9a-f]{64}$' <<< "$rec_sha"; then
+            err "Invalid receipt for $rel_path; use --force to restore explicitly (recovery state retained)"
+            return 1
+        fi
+        if ! grep -Fxq "$cur_sha" <<< "$rec_sha"; then
             info "$rel_path was already updated by Steam; keeping current file"
             return 0
         fi
     fi
 
-    cp -p "$backup" "${dst}.vader5-restore"
-    mv -f "${dst}.vader5-restore" "$dst"
+    local tmp_dst
+    tmp_dst="$(mktemp "${dst}.vader5-restore.XXXXXX")"
+    if ! cp -p "$backup" "$tmp_dst" || ! mv -fT "$tmp_dst" "$dst"; then
+        rm -f -- "$tmp_dst"
+        err "Could not restore $rel_path (recovery state retained)"
+        return 1
+    fi
     ok "Restored stock $rel_path"
 }
 
