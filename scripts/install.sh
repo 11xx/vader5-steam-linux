@@ -222,7 +222,7 @@ RECEIPT_PRIMARY="$RECEIPT_DIR/steamrt64/libSDL3.so.0.sha256"
 current_primary_sha="$(sha256sum "$STEAM_SDL_PRIMARY" | awk '{print $1}')"
 recorded_primary_sha="$(cat "$RECEIPT_PRIMARY" 2>/dev/null || true)"
 
-if [[ -n "$recorded_primary_sha" && "$current_primary_sha" == "$recorded_primary_sha" && -f "$STOCK_BACKUP_PRIMARY" ]]; then
+if [[ -f "$STOCK_BACKUP_PRIMARY" ]] && grep -Fxq "$current_primary_sha" <<< "$recorded_primary_sha"; then
     TARGET_SIZE_64="$(stat -c '%s' "$STOCK_BACKUP_PRIMARY")"
 else
     TARGET_SIZE_64="$(stat -c '%s' "$STEAM_SDL_PRIMARY")"
@@ -384,38 +384,92 @@ mkdir -p "$SDL_DEPLOY_DIR" "$BACKUP_DIR/steamrt64" "$RECEIPT_DIR/steamrt64"
 
 install -m 755 "$BUILT_LIB64" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
 
-_deploy_padded() {
-    local rel_path="$1"
-    local dst="$STEAM_ROOT/$rel_path"
-    local backup="$BACKUP_DIR/$rel_path"
-    local receipt="$RECEIPT_DIR/$rel_path.sha256"
+# Stage every regular library before publishing any replacement. Keep the
+# previous live file for rollback, including when reinstalling a patched build.
+_deploy_all() (
+    local stage="" backup_stage="" receipt_stage="" name dst backup receipt
+    local cur_sha rec_sha target_size new_sha
+    local publishing=0 committed=0
+    local -a paths=()
 
-    if [[ ! -f "$dst" || -L "$dst" ]]; then
-        return 0
-    fi
+    _finish_deploy() {
+        local rc="$1" rollback_failed=0 name
+        if (( publishing && ! committed )); then
+            for name in "${paths[@]}"; do
+                # A successful rename consumed the staged replacement.
+                if [[ ! -e "$stage/$name.new" ]]; then
+                    if ! mv -fT "$stage/$name.original" "$STEAM_ROOT/steamrt64/$name"; then
+                        err "Rollback failed for $name; stock backup and receipt retained"
+                        rollback_failed=1
+                    fi
+                fi
+            done
+        fi
+        if (( rollback_failed )); then
+            err "Previous live files retained in $stage; close Steam and retry uninstall"
+        elif [[ -n "$stage" ]]; then
+            rm -rf -- "$stage"
+        fi
+        [[ -z "$backup_stage" ]] || rm -rf -- "$backup_stage"
+        [[ -z "$receipt_stage" ]] || rm -rf -- "$receipt_stage"
+        exit "$rc"
+    }
+    trap '_finish_deploy "$?"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    stage="$(mktemp -d "$STEAM_ROOT/steamrt64/.vader5-deploy.XXXXXX")"
+    backup_stage="$(mktemp -d "$BACKUP_DIR/steamrt64/.vader5-deploy.XXXXXX")"
+    receipt_stage="$(mktemp -d "$RECEIPT_DIR/steamrt64/.vader5-deploy.XXXXXX")"
 
-    local cur_sha rec_sha target_size
-    cur_sha="$(sha256sum "$dst" | awk '{print $1}')"
-    rec_sha="$(cat "$receipt" 2>/dev/null || true)"
+    for name in libSDL3.so.0 libSDL3.so; do
+        dst="$STEAM_ROOT/steamrt64/$name"
+        backup="$BACKUP_DIR/steamrt64/$name"
+        receipt="$RECEIPT_DIR/steamrt64/$name.sha256"
+        # Steam may supply the unversioned alias as a symlink or omit it.
+        if [[ -L "$dst" || ! -e "$dst" ]]; then
+            if [[ "$name" == libSDL3.so ]]; then
+                continue
+            fi
+            err "Missing regular primary library: $dst"
+            exit 1
+        fi
+        if [[ ! -f "$dst" ]]; then
+            err "Not a regular library: $dst"
+            exit 1
+        fi
 
-    if [[ -n "$rec_sha" && "$cur_sha" == "$rec_sha" && -f "$backup" ]]; then
-        target_size="$(stat -c '%s' "$backup")"
-        info "Keeping existing stock backup for $rel_path ($target_size bytes)"
-    else
-        mkdir -p "$(dirname "$backup")"
-        cp -p "$dst" "$backup"
-        target_size="$(stat -c '%s' "$backup")"
-        ok "Backed up stock $rel_path ($target_size bytes)"
-    fi
+        cp -p "$dst" "$stage/$name.original"
+        cur_sha="$(sha256sum "$stage/$name.original" | awk '{print $1}')"
+        rec_sha=""
+        if [[ -e "$receipt" || -L "$receipt" ]]; then
+            rec_sha="$(cat "$receipt")"
+        fi
+        if [[ -n "$rec_sha" ]] && grep -qEv '^[0-9a-f]{64}$' <<< "$rec_sha"; then
+            err "Invalid receipt for $name; resolve recovery state before reinstalling"
+            exit 1
+        fi
+        if grep -Fxq "$cur_sha" <<< "$rec_sha"; then
+            if [[ ! -f "$backup" ]]; then
+                err "Missing stock backup for patched $name; refusing to overwrite recovery state"
+                exit 1
+            fi
+            target_size="$(stat -c '%s' "$backup")"
+            info "Keeping existing stock backup for $name ($target_size bytes)"
+        else
+            if [[ -z "$rec_sha" && -f "$backup" ]] && ! cmp -s "$backup" "$stage/$name.original"; then
+                err "Missing receipt for $name with a different stock backup; resolve recovery state before reinstalling"
+                exit 1
+            fi
+            cp -p "$stage/$name.original" "$backup_stage/$name"
+            target_size="$(stat -c '%s' "$backup_stage/$name")"
+        fi
+        if (( built_size > target_size )); then
+            err "Built SDL3 ($built_size bytes) exceeds steamrt64/$name stock size ($target_size bytes)"
+            exit 1
+        fi
 
-    if (( built_size > target_size )); then
-        err "Built SDL3 ($built_size bytes) exceeds $rel_path stock size ($target_size bytes)"
-        exit 1
-    fi
-
-    local tmp_dst="${dst}.vader5-tmp"
-    cp "$BUILT_LIB64" "$tmp_dst"
-    python3 - "$tmp_dst" "$target_size" <<'PY'
+        cp "$BUILT_LIB64" "$stage/$name.new"
+        python3 - "$stage/$name.new" "$target_size" <<'PY'
 import os, sys
 path, target = sys.argv[1], int(sys.argv[2])
 cur = os.path.getsize(path)
@@ -430,16 +484,38 @@ if pad > 0:
             f.write(chunk[:n])
             pad -= n
 PY
-    chmod 755 "$tmp_dst"
-    mv -f "$tmp_dst" "$dst"
+        chmod 755 "$stage/$name.new"
+        new_sha="$(sha256sum "$stage/$name.new" | awk '{print $1}')"
+        printf '%s\n' "$new_sha" > "$receipt_stage/$name.final"
+        # During reinstall, both the old and new patched hash must be
+        # recognized until all live renames have succeeded (or rolled back).
+        printf '%s\n' "$new_sha" > "$receipt_stage/$name.transition"
+        if [[ "$cur_sha" != "$new_sha" ]] && grep -Fxq "$cur_sha" <<< "$rec_sha"; then
+            printf '%s\n' "$cur_sha" >> "$receipt_stage/$name.transition"
+        fi
+        paths+=("$name")
+    done
 
-    mkdir -p "$(dirname "$receipt")"
-    sha256sum "$dst" | awk '{print $1}' > "$receipt"
-    ok "Deployed $rel_path (padded to $target_size bytes, +$((target_size - built_size)) zero bytes)"
-}
+    # Publish recovery information before touching any live library. Each
+    # rename is within its destination filesystem; no Steam file is mounted.
+    for name in "${paths[@]}"; do
+        if [[ -f "$backup_stage/$name" ]]; then
+            mv -fT "$backup_stage/$name" "$BACKUP_DIR/steamrt64/$name"
+        fi
+        mv -fT "$receipt_stage/$name.transition" "$RECEIPT_DIR/steamrt64/$name.sha256"
+    done
+    publishing=1
+    for name in "${paths[@]}"; do
+        mv -fT "$stage/$name.new" "$STEAM_ROOT/steamrt64/$name"
+    done
+    committed=1
+    for name in "${paths[@]}"; do
+        mv -fT "$receipt_stage/$name.final" "$RECEIPT_DIR/steamrt64/$name.sha256"
+        ok "Deployed steamrt64/$name (padded to $(stat -c '%s' "$STEAM_ROOT/steamrt64/$name") bytes)"
+    done
+)
 
-_deploy_padded "steamrt64/libSDL3.so.0"
-_deploy_padded "steamrt64/libSDL3.so"
+_deploy_all
 
 # ── 8. Udev rule (elevate only if missing or changed) ─────────────────────────
 
