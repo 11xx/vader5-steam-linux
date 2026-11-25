@@ -333,6 +333,34 @@ exec "$REAL_MV" "$@"
         self.assertEqual(self.live(), STOCK)
         self.assertFalse(self.state.exists())
 
+    def test_scripts_are_executable(self):
+        for name in ("install.sh", "uninstall.sh"):
+            self.assertTrue(os.access(ROOT / "scripts" / name, os.X_OK), f"scripts/{name} lost +x bit")
+
+    def test_steam_update_removes_alias_and_prunes_stale_recovery(self):
+        self.deploy()
+        alias = self.runtime / ALIAS
+        alias.unlink()
+        self.uninstall()
+        self.assertFalse(alias.exists())
+        self.assertEqual((self.runtime / PRIMARY).read_bytes(), STOCK[PRIMARY])
+        self.assertFalse(self.state.exists())
+
+        # Re-create regular alias, deploy both, then convert alias to symlink and reinstall.
+        alias.write_bytes(STOCK[ALIAS])
+        self.deploy()
+        self.assertTrue((self.backups / ALIAS).exists())
+        self.assertTrue((self.receipts / (ALIAS + ".sha256")).exists())
+        alias.unlink()
+        alias.symlink_to(PRIMARY)
+        self.deploy()
+        self.assertTrue(alias.is_symlink())
+        self.assertFalse((self.backups / ALIAS).exists())
+        self.assertFalse((self.receipts / (ALIAS + ".sha256")).exists())
+        self.uninstall()
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual((self.runtime / PRIMARY).read_bytes(), STOCK[PRIMARY])
+
 
 if __name__ == "__main__":
     if os.geteuid() == 0:

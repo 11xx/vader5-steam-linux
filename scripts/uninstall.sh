@@ -83,6 +83,10 @@ _restore_file() {
         info "$rel_path is now a symlink; keeping Steam's current path"
         return 0
     fi
+    if [[ "$FORCE" != "1" && "$rel_path" == "steamrt64/libSDL3.so" && ! -e "$dst" && ! -L "$dst" ]]; then
+        info "$rel_path is absent; keeping Steam's current layout"
+        return 0
+    fi
     if [[ -e "$dst" && ! -f "$dst" && ! -L "$dst" ]]; then
         err "Not a regular library: $dst (recovery state retained)"
         return 1

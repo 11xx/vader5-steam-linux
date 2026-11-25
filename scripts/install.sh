@@ -222,6 +222,11 @@ RECEIPT_PRIMARY="$RECEIPT_DIR/steamrt64/libSDL3.so.0.sha256"
 current_primary_sha="$(sha256sum "$STEAM_SDL_PRIMARY" | awk '{print $1}')"
 recorded_primary_sha="$(cat "$RECEIPT_PRIMARY" 2>/dev/null || true)"
 
+if [[ -n "$recorded_primary_sha" ]] && grep -qEv '^[0-9a-f]{64}$' <<< "$recorded_primary_sha"; then
+    err "Invalid receipt for libSDL3.so.0; resolve recovery state before reinstalling"
+    exit 1
+fi
+
 if [[ -f "$STOCK_BACKUP_PRIMARY" ]] && grep -Fxq "$current_primary_sha" <<< "$recorded_primary_sha"; then
     TARGET_SIZE_64="$(stat -c '%s' "$STOCK_BACKUP_PRIMARY")"
 else
@@ -389,9 +394,10 @@ install -m 755 "$BUILT_LIB64" "$SDL_DEPLOY_DIR/libSDL3-64.so.0"
 _deploy_all() (
     local stage="" backup_stage="" receipt_stage="" name dst backup receipt
     local cur_sha rec_sha target_size new_sha
-    local publishing=0 committed=0
+    local publishing=0 committed=0 prune_alias=0
     local -a paths=()
 
+    # shellcheck disable=SC2329 # Invoked indirectly by the EXIT trap.
     _finish_deploy() {
         local rc="$1" rollback_failed=0 name
         if (( publishing && ! committed )); then
@@ -428,6 +434,7 @@ _deploy_all() (
         # Steam may supply the unversioned alias as a symlink or omit it.
         if [[ -L "$dst" || ! -e "$dst" ]]; then
             if [[ "$name" == libSDL3.so ]]; then
+                prune_alias=1
                 continue
             fi
             err "Missing regular primary library: $dst"
@@ -513,6 +520,9 @@ PY
         mv -fT "$receipt_stage/$name.final" "$RECEIPT_DIR/steamrt64/$name.sha256"
         ok "Deployed steamrt64/$name (padded to $(stat -c '%s' "$STEAM_ROOT/steamrt64/$name") bytes)"
     done
+    if (( prune_alias )); then
+        rm -f -- "$BACKUP_DIR/steamrt64/libSDL3.so" "$RECEIPT_DIR/steamrt64/libSDL3.so.sha256"
+    fi
 )
 
 _deploy_all

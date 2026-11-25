@@ -73,6 +73,7 @@ Run `make` with no arguments to see all targets:
 | `make status` | Check firmware version, battery, `ThirdPartyEnabled`, and current HID owner |
 | `make enable` / `make disable` | Toggle `ThirdPartyEnabled` directly over Linux `hidraw` (`7.1.x` firmware) |
 | `make check` | Lint `scripts/install.sh` and `scripts/uninstall.sh` |
+| `make test` | Run isolated deployment and rollback recovery tests |
 
 To force raw Flydigi HID rumble instead of the hidden `xpad` backend for ordinary rumble, set `SDL_JOYSTICK_HIDAPI_FLYDIGI_VADER5_XPAD_RUMBLE=0`.
 

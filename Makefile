@@ -1,4 +1,4 @@
-.PHONY: help install uninstall update-sdl rebuild status enable disable check
+.PHONY: help install uninstall update-sdl rebuild status enable disable check test
 
 help:
 	@printf '%s\n' \
@@ -10,7 +10,8 @@ help:
 		'  status      Show controller firmware and third-party flag state' \
 		'  enable      Enable controller third-party mapping firmware flag' \
 		'  disable     Disable controller third-party mapping firmware flag' \
-		'  check       Lint install/uninstall scripts with bash -n and shellcheck'
+		'  check       Lint install/uninstall scripts with bash -n and shellcheck' \
+		'  test        Run isolated deployment/rollback recovery tests'
 
 install:
 	bash scripts/install.sh
@@ -35,3 +36,6 @@ disable:
 
 check:
 	bash -n scripts/install.sh scripts/uninstall.sh && shellcheck scripts/install.sh scripts/uninstall.sh
+
+test:
+	python3 tests/test_recovery.py
